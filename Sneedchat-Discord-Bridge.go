@@ -291,11 +291,18 @@ func NewCookieRefreshService(username, password, domain string) (*CookieRefreshS
 		return nil, err
 	}
 
+	// Add User-Agent to mimic browser
+	transport := &http.Transport{}
+	
 	return &CookieRefreshService{
 		username:    username,
 		password:    password,
 		domain:      domain,
-		client:      &http.Client{Jar: jar, Timeout: 30 * time.Second},
+		client:      &http.Client{
+			Jar:       jar,
+			Timeout:   30 * time.Second,
+			Transport: transport,
+		},
 		cookieReady: make(chan struct{}),
 		stopChan:    make(chan struct{}),
 	}, nil
@@ -473,7 +480,8 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	}
 	if clearanceToken != "" {
 		log.Println("✅ KiwiFlare challenge solved")
-		time.Sleep(1 * time.Second) // allow propagation
+		log.Println("⏳ Waiting 2 seconds for cookie propagation...")
+		time.Sleep(2 * time.Second) // Increased from 1s to 2s
 	}
 
 	// Force a new TLS session to avoid stale keep-alive
@@ -485,6 +493,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	req, _ := http.NewRequest("GET", loginURL, nil)
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("User-Agent", "Sneedchat-Discord-Go-Bridge")
 	req.URL.RawQuery = fmt.Sprintf("r=%d", rand.Intn(999999))
 
 	resp, err := crs.client.Do(req)
@@ -499,6 +508,10 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 
 	body, _ := io.ReadAll(resp.Body)
 	bodyStr := string(body)
+
+	// Small delay after getting login page
+	log.Println("⏳ Waiting 1 second before processing login page...")
+	time.Sleep(1 * time.Second)
 
 	// Step 3: Extract CSRF token
 	log.Println("Step 3: Extracting CSRF token...")
@@ -532,17 +545,47 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 		"remember":    {"1"},
 	}
 
+	// Debug: Show cookies being sent
+	debugCookieURL, _ := url.Parse(fmt.Sprintf("https://%s/", crs.domain))
+	currentCookies := crs.client.Jar.Cookies(debugCookieURL)
+	log.Printf("Cookies before login POST (%d):", len(currentCookies))
+	for _, c := range currentCookies {
+		log.Printf("  - %s = %s...", c.Name, c.Value[:min(10, len(c.Value))])
+	}
+
 	crs.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
 
-	loginResp, err := crs.client.PostForm(postURL, formData)
+	// Create POST request manually to add User-Agent
+	postReq, _ := http.NewRequest("POST", postURL, strings.NewReader(formData.Encode()))
+	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	postReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	postReq.Header.Set("Referer", loginURL)
+	postReq.Header.Set("Origin", fmt.Sprintf("https://%s", crs.domain))
+
+	loginResp, err := crs.client.Do(postReq)
 	if err != nil {
 		return "", fmt.Errorf("login POST failed: %w", err)
 	}
 	defer loginResp.Body.Close()
 
 	log.Printf("Login response status: %d", loginResp.StatusCode)
+
+	// Debug: Check if we got Set-Cookie headers
+	setCookies := loginResp.Header.Values("Set-Cookie")
+	if len(setCookies) > 0 {
+		log.Printf("Set-Cookie headers received: %d", len(setCookies))
+		for _, sc := range setCookies {
+			log.Printf("  - %s", sc[:min(80, len(sc))])
+		}
+	} else {
+		log.Println("⚠️ No Set-Cookie headers in login response!")
+	}
+
+	// Delay before checking cookies
+	log.Println("⏳ Waiting 1 second for login to process...")
+	time.Sleep(1 * time.Second)
 
 	// Step 5: Extract cookies
 	log.Println("Step 5: Extracting authentication cookies...")
@@ -572,9 +615,17 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	if !hasXfUser && loginResp.StatusCode >= 300 && loginResp.StatusCode < 400 {
 		if loc := loginResp.Header.Get("Location"); loc != "" {
 			log.Printf("Following redirect to %s to check for xf_user...", loc)
-			followResp, err := crs.client.Get(fmt.Sprintf("https://%s%s", crs.domain, loc))
+			time.Sleep(1 * time.Second) // Wait before following redirect
+			
+			followURL := loc
+			if !strings.HasPrefix(loc, "http") {
+				followURL = fmt.Sprintf("https://%s%s", crs.domain, loc)
+			}
+			
+			followResp, err := crs.client.Get(followURL)
 			if err == nil {
 				followResp.Body.Close()
+				time.Sleep(1 * time.Second) // Wait after redirect
 				cookies = crs.client.Jar.Cookies(cookieURL)
 				cookieStrs = []string{} // Reset
 				for _, c := range cookies {
