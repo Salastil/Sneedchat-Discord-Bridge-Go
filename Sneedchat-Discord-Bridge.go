@@ -481,7 +481,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	if clearanceToken != "" {
 		log.Println("✅ KiwiFlare challenge solved")
 		log.Println("⏳ Waiting 2 seconds for cookie propagation...")
-		time.Sleep(2 * time.Second) // Increased from 1s to 2s
+		time.Sleep(3 * time.Second) // Increased from 1s to 2s
 	}
 
 	// Force a new TLS session to avoid stale keep-alive
@@ -511,7 +511,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 
 	// Small delay after getting login page
 	log.Println("⏳ Waiting 1 second before processing login page...")
-	time.Sleep(1 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Step 3: Extract CSRF token
 	log.Println("Step 3: Extracting CSRF token...")
@@ -585,7 +585,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 
 	// Delay before checking cookies
 	log.Println("⏳ Waiting 1 second for login to process...")
-	time.Sleep(1 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Step 5: Extract cookies
 	log.Println("Step 5: Extracting authentication cookies...")
@@ -615,7 +615,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	if !hasXfUser && loginResp.StatusCode >= 300 && loginResp.StatusCode < 400 {
 		if loc := loginResp.Header.Get("Location"); loc != "" {
 			log.Printf("Following redirect to %s to check for xf_user...", loc)
-			time.Sleep(1 * time.Second) // Wait before following redirect
+			time.Sleep(3 * time.Second) // Wait before following redirect
 			
 			followURL := loc
 			if !strings.HasPrefix(loc, "http") {
@@ -625,7 +625,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 			followResp, err := crs.client.Get(followURL)
 			if err == nil {
 				followResp.Body.Close()
-				time.Sleep(1 * time.Second) // Wait after redirect
+				time.Sleep(3 * time.Second) // Wait after redirect
 				cookies = crs.client.Jar.Cookies(cookieURL)
 				cookieStrs = []string{} // Reset
 				for _, c := range cookies {
