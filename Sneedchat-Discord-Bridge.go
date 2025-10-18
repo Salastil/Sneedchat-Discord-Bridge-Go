@@ -308,9 +308,18 @@ func NewCookieRefreshService(username, password, domain string) (*CookieRefreshS
 	}, nil
 }
 
+
+
 func (crs *CookieRefreshService) getClearanceToken() (string, error) {
 	baseURL := fmt.Sprintf("https://%s/", crs.domain)
-	resp, err := crs.client.Get(baseURL)
+
+	req, _ := http.NewRequest("GET", baseURL, nil)
+	req.Header.Set("User-Agent", randomUserAgent())
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Connection", "keep-alive")
+
+	resp, err := crs.client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -321,114 +330,108 @@ func (crs *CookieRefreshService) getClearanceToken() (string, error) {
 		return "", err
 	}
 
-	// Try multiple patterns for KiwiFlare challenge detection
-	patterns := []*regexp.Regexp{
-		regexp.MustCompile(`<html[^>]*id=["']sssg["'][^>]*data-sssg-challenge=["']([^"']+)["'][^>]*data-sssg-difficulty=["'](\d+)["']`),
-		regexp.MustCompile(`<html[^>]*id=["']sssg["'][^>]*data-sssg-difficulty=["'](\d+)["'][^>]*data-sssg-challenge=["']([^"']+)["']`),
-		regexp.MustCompile(`data-sssg-challenge=["']([^"']+)["'][^>]*data-sssg-difficulty=["'](\d+)["']`),
-	}
-
-	var salt string
-	var difficulty int
-	found := false
-
-	for i, pattern := range patterns {
-		matches := pattern.FindStringSubmatch(string(body))
-		if len(matches) >= 3 {
-			if i == 1 {
-				// Pattern has difficulty first, then challenge
-				difficulty, _ = strconv.Atoi(matches[1])
-				salt = matches[2]
-			} else {
-				salt = matches[1]
-				difficulty, _ = strconv.Atoi(matches[2])
-			}
-			found = true
-			break
-		}
-	}
-
-	if !found {
+	// Detect challenge
+	pattern := regexp.MustCompile(`data-sssg-challenge=["']([^"']+)["'][^>]*data-sssg-difficulty=["'](\d+)["']`)
+	m := pattern.FindStringSubmatch(string(body))
+	if len(m) < 3 {
 		log.Println("No KiwiFlare challenge required")
 		return "", nil
 	}
 
+	salt := m[1]
+	difficulty, _ := strconv.Atoi(m[2])
 	if difficulty == 0 {
 		return "", nil
 	}
 
 	log.Printf("Solving KiwiFlare challenge (difficulty=%d)", difficulty)
+	time.Sleep(time.Duration(500+rand.Intn(750)) * time.Millisecond) // human delay before compute
 
 	nonce, err := crs.solvePoW(salt, difficulty)
 	if err != nil {
 		return "", err
 	}
 
+	// Delay between solve and submit to mimic browser JS runtime
+	time.Sleep(time.Duration(700+rand.Intn(900)) * time.Millisecond)
+
 	submitURL := fmt.Sprintf("https://%s/.sssg/api/answer", crs.domain)
 	formData := url.Values{"a": {salt}, "b": {nonce}}
 
-	submitResp, err := crs.client.PostForm(submitURL, formData)
+	submitReq, _ := http.NewRequest("POST", submitURL, strings.NewReader(formData.Encode()))
+	submitReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	submitReq.Header.Set("User-Agent", randomUserAgent())
+	submitReq.Header.Set("Origin", fmt.Sprintf("https://%s", crs.domain))
+	submitReq.Header.Set("Referer", baseURL)
+
+	submitResp, err := crs.client.Do(submitReq)
 	if err != nil {
 		return "", err
 	}
 	defer submitResp.Body.Close()
 
-	var result map[string]interface{}
-	if err := json.NewDecoder(submitResp.Body).Decode(&result); err != nil {
-		return "", err
+	if submitResp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("KiwiFlare submit returned HTTP %d", submitResp.StatusCode)
 	}
 
-	if auth, ok := result["auth"].(string); ok {
-		// Manually add the clearance cookie to the jar
-		cookieURL, _ := url.Parse(baseURL)
-		clearanceCookie := &http.Cookie{
-			Name:   "sssg_clearance",
-			Value:  auth,
-			Path:   "/",
-			Domain: crs.domain,
+	// Pause before reading cookie jar
+	time.Sleep(time.Duration(1200+rand.Intn(800)) * time.Millisecond)
+
+	cookieURL, _ := url.Parse(baseURL)
+	cookies := crs.client.Jar.Cookies(cookieURL)
+	for _, c := range cookies {
+		if c.Name == "sssg_clearance" {
+			log.Printf("✅ KiwiFlare clearance cookie confirmed: %s...", c.Value[:min(10, len(c.Value))])
+			return c.Value, nil
 		}
-		crs.client.Jar.SetCookies(cookieURL, []*http.Cookie{clearanceCookie})
-		log.Println("✅ KiwiFlare clearance cookie set")
-		return auth, nil
 	}
 
-	return "", fmt.Errorf("no auth token in response")
+	return "", fmt.Errorf("no sssg_clearance cookie after solve")
 }
 
 func (crs *CookieRefreshService) solvePoW(salt string, difficulty int) (string, error) {
-	nonce := rand.Int63()
+	start := time.Now()
 	requiredBytes := difficulty / 8
 	requiredBits := difficulty % 8
-	maxAttempts := 10_000_000
 
-	for attempts := 0; attempts < maxAttempts; attempts++ {
-		nonce++
-
+	for nonce := rand.Int63(); ; nonce++ {
 		input := fmt.Sprintf("%s%d", salt, nonce)
 		hash := sha256.Sum256([]byte(input))
-
 		valid := true
+
 		for i := 0; i < requiredBytes; i++ {
 			if hash[i] != 0 {
 				valid = false
 				break
 			}
 		}
-
 		if valid && requiredBits > 0 && requiredBytes < len(hash) {
 			mask := byte(0xFF << (8 - requiredBits))
 			if hash[requiredBytes]&mask != 0 {
 				valid = false
 			}
 		}
-
 		if valid {
+			elapsed := time.Since(start)
+			// Minimum 2–4 second human-like response window
+			minDelay := time.Duration(2+rand.Intn(3)) * time.Second
+			if elapsed < minDelay {
+				time.Sleep(minDelay - elapsed)
+			}
 			return fmt.Sprintf("%d", nonce), nil
 		}
 	}
-
-	return "", fmt.Errorf("failed to solve PoW within %d attempts", maxAttempts)
 }
+
+func randomUserAgent() string {
+	agents := []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+	}
+	return agents[rand.Intn(len(agents))]
+}
+
 
 func (crs *CookieRefreshService) FetchFreshCookie() (string, error) {
 	attempt := 0
@@ -465,12 +468,9 @@ func (crs *CookieRefreshService) FetchFreshCookie() (string, error) {
 }
 
 func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
-	// Always start with a fresh cookie jar
-	jar, err := cookiejar.New(nil)
-	if err != nil {
-		return "", err
-	}
-	crs.client.Jar = jar
+	// DON'T create a fresh jar - reuse the existing one so clearance cookie persists
+	// Only reset the transport for fresh TLS
+	crs.client.Transport = &http.Transport{}
 
 	log.Println("Step 1: Checking for KiwiFlare challenge...")
 
@@ -480,12 +480,9 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	}
 	if clearanceToken != "" {
 		log.Println("✅ KiwiFlare challenge solved")
-		log.Println("⏳ Waiting 2 seconds for cookie propagation...")
-		time.Sleep(3 * time.Second) // Increased from 1s to 2s
+		log.Println("⏳ Waiting 3 seconds for cookie propagation...")
+		time.Sleep(3 * time.Second)
 	}
-
-	// Force a new TLS session to avoid stale keep-alive
-	crs.client.Transport = &http.Transport{}
 
 	// Step 2: Fetch login page
 	log.Println("Step 2: Fetching login page...")
@@ -493,7 +490,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	req, _ := http.NewRequest("GET", loginURL, nil)
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("User-Agent", "Sneedchat-Discord-Go-Bridge")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.URL.RawQuery = fmt.Sprintf("r=%d", rand.Intn(999999))
 
 	resp, err := crs.client.Do(req)
@@ -511,7 +508,7 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 
 	// Small delay after getting login page
 	log.Println("⏳ Waiting 1 second before processing login page...")
-	time.Sleep(3 * time.Second)
+	time.Sleep(1 * time.Second)
 
 	// Step 3: Extract CSRF token
 	log.Println("Step 3: Extracting CSRF token...")
@@ -583,9 +580,40 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 		log.Println("⚠️ No Set-Cookie headers in login response!")
 	}
 
+	// If we got HTTP 200, login failed - read the error
+	if loginResp.StatusCode == 200 {
+		bodyBytes, _ := io.ReadAll(loginResp.Body)
+		bodyText := string(bodyBytes)
+		
+		// Look for XenForo error messages
+		errorPatterns := []*regexp.Regexp{
+			regexp.MustCompile(`<div class="blockMessage blockMessage--error[^>]*>(.*?)</div>`),
+			regexp.MustCompile(`data-xf-init="auto-submit"[^>]*data-message="([^"]+)"`),
+			regexp.MustCompile(`"errors":\s*\[(.*?)\]`),
+		}
+		
+		var errorMsg string
+		for _, pattern := range errorPatterns {
+			if matches := pattern.FindStringSubmatch(bodyText); len(matches) >= 2 {
+				errorMsg = matches[1]
+				// Strip HTML tags
+				errorMsg = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(errorMsg, "")
+				break
+			}
+		}
+		
+		if errorMsg != "" {
+			log.Printf("❌ Login error from server: %s", strings.TrimSpace(errorMsg))
+		} else {
+			log.Printf("❌ Login failed (HTTP 200). Response snippet:\n%s", bodyText[:min(1000, len(bodyText))])
+		}
+		
+		return "", fmt.Errorf("login failed with HTTP 200 - server rejected credentials or challenge not accepted")
+	}
+
 	// Delay before checking cookies
 	log.Println("⏳ Waiting 1 second for login to process...")
-	time.Sleep(3 * time.Second)
+	time.Sleep(1 * time.Second)
 
 	// Step 5: Extract cookies
 	log.Println("Step 5: Extracting authentication cookies...")
@@ -615,17 +643,20 @@ func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
 	if !hasXfUser && loginResp.StatusCode >= 300 && loginResp.StatusCode < 400 {
 		if loc := loginResp.Header.Get("Location"); loc != "" {
 			log.Printf("Following redirect to %s to check for xf_user...", loc)
-			time.Sleep(3 * time.Second) // Wait before following redirect
+			time.Sleep(1 * time.Second) // Wait before following redirect
 			
 			followURL := loc
 			if !strings.HasPrefix(loc, "http") {
 				followURL = fmt.Sprintf("https://%s%s", crs.domain, loc)
 			}
 			
-			followResp, err := crs.client.Get(followURL)
+			followReq, _ := http.NewRequest("GET", followURL, nil)
+			followReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+			
+			followResp, err := crs.client.Do(followReq)
 			if err == nil {
 				followResp.Body.Close()
-				time.Sleep(3 * time.Second) // Wait after redirect
+				time.Sleep(1 * time.Second) // Wait after redirect
 				cookies = crs.client.Jar.Cookies(cookieURL)
 				cookieStrs = []string{} // Reset
 				for _, c := range cookies {
