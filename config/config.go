@@ -35,13 +35,11 @@ func Load(envFile string) (*Config, error) {
 		BridgePassword:    os.Getenv("BRIDGE_PASSWORD"),
 		DiscordPingUserID: os.Getenv("DISCORD_PING_USER_ID"),
 	}
-
 	roomID, err := strconv.Atoi(os.Getenv("SNEEDCHAT_ROOM_ID"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid SNEEDCHAT_ROOM_ID: %w", err)
 	}
 	cfg.SneedchatRoomID = roomID
-
 	if v := os.Getenv("BRIDGE_USER_ID"); v != "" {
 		cfg.BridgeUserID, _ = strconv.Atoi(v)
 	}

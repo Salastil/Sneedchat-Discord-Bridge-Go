@@ -31,7 +31,6 @@ func (r *RefreshService) getClearanceToken() (string, error) {
 
 	body, _ := io.ReadAll(resp.Body)
 
-	// Detect challenge (several patterns)
 	patterns := []*regexp.Regexp{
 		regexp.MustCompile(`<html[^>]*id=["']sssg["'][^>]*data-sssg-challenge=["']([^"']+)["'][^>]*data-sssg-difficulty=["'](\d+)["']`),
 		regexp.MustCompile(`<html[^>]*id=["']sssg["'][^>]*data-sssg-difficulty=["'](\d+)["'][^>]*data-sssg-challenge=["']([^"']+)["']`),
@@ -81,7 +80,6 @@ func (r *RefreshService) getClearanceToken() (string, error) {
 	}
 	defer resp2.Body.Close()
 
-	// Some deployments return JSON like {"auth":"..."}
 	var result map[string]any
 	_ = json.NewDecoder(resp2.Body).Decode(&result)
 
@@ -95,7 +93,6 @@ func (r *RefreshService) getClearanceToken() (string, error) {
 		}
 	}
 	if v, ok := result["auth"].(string); ok && v != "" {
-		// Fallback: manually add
 		r.client.Jar.SetCookies(cookieURL, []*http.Cookie{{
 			Name:   "sssg_clearance",
 			Value:  v,

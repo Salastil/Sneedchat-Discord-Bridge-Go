@@ -39,7 +39,7 @@ type RefreshService struct {
 func NewRefreshService(username, password, domain string) *RefreshService {
 	jar, _ := cookiejar.New(nil)
 	tr := &http.Transport{
-		// Force HTTP/1.1 (avoid ALPN h2 differences)
+		// Force HTTP/1.1 to avoid Cloudflare/ALPN issues
 		TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
 	}
 	client := &http.Client{
@@ -77,7 +77,6 @@ func (r *RefreshService) GetCurrentCookie() string {
 
 func (r *RefreshService) loop() {
 	defer r.wg.Done()
-
 	log.Println("🔑 Fetching initial cookie...")
 	c, err := r.FetchFreshCookie()
 	if err != nil {
@@ -196,11 +195,11 @@ func (r *RefreshService) attemptFetchCookie() (string, error) {
 		"remember":      {"1"},
 	}
 
-	// ensure GET cookies are kept
 	cookieURL, _ := url.Parse(fmt.Sprintf("https://%s/", r.domain))
-	if resp.Cookies() != nil {
-		r.client.Jar.SetCookies(cookieURL, resp.Cookies())
+	for _, c := range r.client.Jar.Cookies(cookieURL) {
+		c.Domain = strings.TrimPrefix(c.Domain, ".")
 	}
+	r.client.Jar.SetCookies(cookieURL, r.client.Jar.Cookies(cookieURL))
 
 	postReq, _ := http.NewRequest("POST", postURL, strings.NewReader(form.Encode()))
 	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -208,9 +207,10 @@ func (r *RefreshService) attemptFetchCookie() (string, error) {
 	postReq.Header.Set("Referer", loginURL)
 	postReq.Header.Set("Origin", fmt.Sprintf("https://%s", r.domain))
 	postReq.Header.Set("X-XF-Token", csrf)
+	postReq.Header.Set("X-Requested-With", "XMLHttpRequest")
 	postReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	postReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	postReq.Header.Set("Accept-Encoding", "gzip, deflate") // avoid br
+	postReq.Header.Set("Accept-Encoding", "gzip, deflate")
 
 	loginResp, err := r.client.Do(postReq)
 	if err != nil {
@@ -219,7 +219,7 @@ func (r *RefreshService) attemptFetchCookie() (string, error) {
 	defer loginResp.Body.Close()
 	log.Printf("Login response status: %d", loginResp.StatusCode)
 
-	// Follow a single redirect (XenForo usually sets xf_user on redirect target)
+	// Follow redirect if present
 	if loginResp.StatusCode >= 300 && loginResp.StatusCode < 400 {
 		if loc := loginResp.Header.Get("Location"); loc != "" {
 			log.Printf("Following redirect to %s to check for xf_user...", loc)
@@ -255,10 +255,15 @@ func (r *RefreshService) attemptFetchCookie() (string, error) {
 		return r.retryWithFreshCSRF()
 	}
 
-	// Normalize cookie domains and compose cookie string
+	// Wait before extracting cookies
+	log.Println("⏳ Waiting 2 seconds for XenForo to issue cookies...")
+	time.Sleep(2 * time.Second)
+
+	// Normalize and show cookies
 	cookies := r.client.Jar.Cookies(cookieURL)
 	for _, c := range cookies {
 		c.Domain = strings.TrimPrefix(c.Domain, ".")
+		log.Printf("Cookie after login: %s=%s", c.Name, c.Value)
 	}
 	r.client.Jar.SetCookies(cookieURL, cookies)
 

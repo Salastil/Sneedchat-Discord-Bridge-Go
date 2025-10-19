@@ -61,16 +61,12 @@ func (r *RefreshService) retryWithFreshCSRF() (string, error) {
 	} else {
 		reader = io.NopCloser(resp2.Body)
 	}
-	b, _ := io.ReadAll(reader)
-	if strings.Contains(string(b), `data-logged-in="true"`) {
-		log.Println("✅ Retry indicates logged in successfully")
-	}
+	_, _ = io.ReadAll(reader)
 
 	cookieURL, _ := url.Parse(fmt.Sprintf("https://%s/", r.domain))
 	for _, c := range r.client.Jar.Cookies(cookieURL) {
 		if c.Name == "xf_user" {
 			log.Printf("✅ Successfully fetched fresh cookie with xf_user: %.12s...", c.Value)
-			// Rebuild cookie header with known-good set (reuse attemptFetchCookie’s logic if you want)
 			return "xf_user=" + c.Value, nil
 		}
 	}

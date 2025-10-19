@@ -15,7 +15,6 @@ import (
 
 func main() {
 	envFile := ".env"
-	// allow: ./bin --env /path/to/.env
 	for i, a := range os.Args {
 		if a == "--env" && i+1 < len(os.Args) {
 			envFile = os.Args[i+1]
@@ -30,21 +29,19 @@ func main() {
 	log.Printf("Using Sneedchat room ID: %d", cfg.SneedchatRoomID)
 	log.Printf("Bridge username: %s", cfg.BridgeUsername)
 
-	// Cookie service
+	// Cookie service (HTTP/1.1, KF PoW, CSRF retry)
 	cookieSvc := cookie.NewRefreshService(cfg.BridgeUsername, cfg.BridgePassword, "kiwifarms.st")
 	cookieSvc.Start()
 	log.Println("⏳ Waiting for initial cookie...")
 	cookieSvc.WaitForCookie()
-
-	initialCookie := cookieSvc.GetCurrentCookie()
-	if initialCookie == "" {
+	if cookieSvc.GetCurrentCookie() == "" {
 		log.Fatal("❌ Failed to obtain initial cookie, cannot start bridge")
 	}
 
 	// Sneedchat client
 	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, cookieSvc)
 
-	// Discord bridge
+	// Discord bridge (full parity features)
 	bridge, err := discord.NewBridge(cfg, sneedClient)
 	if err != nil {
 		log.Fatalf("Failed to create Discord bridge: %v", err)
@@ -54,7 +51,7 @@ func main() {
 	}
 	log.Println("🌉 Discord-Sneedchat Bridge started successfully")
 
-	// Periodic cookie refresh
+	// Auto cookie refresh every 4h
 	go func() {
 		t := time.NewTicker(4 * time.Hour)
 		defer t.Stop()
