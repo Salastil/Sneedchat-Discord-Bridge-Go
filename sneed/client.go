@@ -27,7 +27,7 @@ const (
 type Client struct {
 	wsURL   string
 	roomID  int
-	cookies *cookie.RefreshService
+	cookies *cookie.CookieRefreshService
 
 	conn      *websocket.Conn
 	connected bool
@@ -58,7 +58,7 @@ type Client struct {
 	bridgeUsername string
 }
 
-func NewClient(roomID int, cookieSvc *cookie.RefreshService) *Client {
+func NewClient(roomID int, cookieSvc *cookie.CookieRefreshService) *Client {
 	return &Client{
 		wsURL:               "wss://kiwifarms.st:9443/chat.ws",
 		roomID:              roomID,

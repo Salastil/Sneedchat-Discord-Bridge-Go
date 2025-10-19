@@ -1,9 +1,11 @@
 package main
 
 import (
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -21,16 +23,60 @@ func main() {
 		}
 	}
 
+	// Load configuration
 	cfg, err := config.Load(envFile)
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+
+	// Parse --debug flag from CLI (overrides .env)
+	debug := false
+	for _, a := range os.Args {
+		if a == "--debug" {
+			debug = true
+		}
+	}
+	cfg.Debug = debug
+
+	// ---- File logging (env-driven) ------------------------------------------
+	// Use LOG_FILE or BRIDGE_LOG_FILE (first non-empty wins)
+	logPath := os.Getenv("LOG_FILE")
+	if logPath == "" {
+		logPath = os.Getenv("BRIDGE_LOG_FILE")
+	}
+	if logPath != "" {
+		// Ensure parent dir exists
+		if dir := filepath.Dir(logPath); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0o755)
+		}
+		f, ferr := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if ferr != nil {
+			log.Printf("⚠️ Failed to open log file '%s' (%v). Continuing with stdout only.", logPath, ferr)
+		} else {
+			// Tee logs to both stdout and file
+			log.SetOutput(io.MultiWriter(os.Stdout, f))
+			// microseconds for tighter timing on auth/debug traces
+			log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+			log.Printf("📝 File logging enabled: %s", logPath)
+		}
+	} else {
+		// keep default stdout with microseconds for consistency
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	}
+	// -------------------------------------------------------------------------
+
 	log.Printf("Using .env file: %s", envFile)
 	log.Printf("Using Sneedchat room ID: %d", cfg.SneedchatRoomID)
 	log.Printf("Bridge username: %s", cfg.BridgeUsername)
+	if cfg.Debug {
+		log.Println("🪲 Debug mode enabled — full HTTP and cookie trace logging active")
+	}
 
-	// Cookie service (HTTP/1.1, KF PoW, CSRF retry)
-	cookieSvc := cookie.NewRefreshService(cfg.BridgeUsername, cfg.BridgePassword, "kiwifarms.st")
+	// Cookie service (HTTP/1.1/2, KiwiFlare PoW, CSRF, deep debug)
+	cookieSvc, err := cookie.NewCookieRefreshService(cfg.BridgeUsername, cfg.BridgePassword, "kiwifarms.st", cfg.Debug)
+	if err != nil {
+		log.Fatalf("Failed to create cookie service: %v", err)
+	}
 	cookieSvc.Start()
 	log.Println("⏳ Waiting for initial cookie...")
 	cookieSvc.WaitForCookie()
@@ -51,7 +97,7 @@ func main() {
 	}
 	log.Println("🌉 Discord-Sneedchat Bridge started successfully")
 
-	// Auto cookie refresh every 4h
+	// Auto cookie refresh every 4h (in addition to background loop inside service)
 	go func() {
 		t := time.NewTicker(4 * time.Hour)
 		defer t.Stop()

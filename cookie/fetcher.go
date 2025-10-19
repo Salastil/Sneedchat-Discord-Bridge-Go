@@ -1,8 +1,8 @@
 package cookie
 
 import (
-	"compress/gzip"
-	"crypto/tls"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,297 +11,433 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-const (
-	CookieRetryDelay    = 5 * time.Second
-	MaxCookieRetryDelay = 60 * time.Second
-	CookieRefreshEvery  = 4 * time.Hour
-)
-
-type RefreshService struct {
-	username, password, domain string
-	client                     *http.Client
-
-	cookieMu      sync.RWMutex
+// CookieRefreshService manages periodic cookie refreshing.
+type CookieRefreshService struct {
+	username      string
+	password      string
+	domain        string
+	client        *http.Client
+	debug         bool
 	currentCookie string
-
-	readyOnce sync.Once
-	readyCh   chan struct{}
-
-	stopCh chan struct{}
-	wg     sync.WaitGroup
+	cookieMu      sync.RWMutex
+	cookieReady   chan struct{}
+	stopChan      chan struct{}
+	wg            sync.WaitGroup
 }
 
-func NewRefreshService(username, password, domain string) *RefreshService {
-	jar, _ := cookiejar.New(nil)
-	tr := &http.Transport{
-		// Force HTTP/1.1 to avoid Cloudflare/ALPN issues
-		TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper),
-	}
-	client := &http.Client{
-		Jar:       jar,
-		Timeout:   30 * time.Second,
-		Transport: tr,
-	}
-	return &RefreshService{
-		username: username,
-		password: password,
-		domain:   domain,
-		client:   client,
-		readyCh:  make(chan struct{}),
-		stopCh:   make(chan struct{}),
-	}
-}
-
-func (r *RefreshService) Start() {
-	r.wg.Add(1)
-	go r.loop()
-}
-
-func (r *RefreshService) Stop() {
-	close(r.stopCh)
-	r.wg.Wait()
-}
-
-func (r *RefreshService) WaitForCookie() { <-r.readyCh }
-
-func (r *RefreshService) GetCurrentCookie() string {
-	r.cookieMu.RLock()
-	defer r.cookieMu.RUnlock()
-	return r.currentCookie
-}
-
-func (r *RefreshService) loop() {
-	defer r.wg.Done()
-	log.Println("🔑 Fetching initial cookie...")
-	c, err := r.FetchFreshCookie()
+// NewCookieRefreshService initializes a new cookie service.
+func NewCookieRefreshService(username, password, domain string, debug bool) (*CookieRefreshService, error) {
+	jar, err := cookiejar.New(nil)
 	if err != nil {
-		log.Printf("❌ Failed to acquire initial cookie: %v", err)
+		return nil, err
+	}
+
+	client := &http.Client{
+		Jar:     jar,
+		Timeout: 45 * time.Second,
+	}
+
+	return &CookieRefreshService{
+		username:    username,
+		password:    password,
+		domain:      domain,
+		client:      client,
+		debug:       debug,
+		cookieReady: make(chan struct{}),
+		stopChan:    make(chan struct{}),
+	}, nil
+}
+
+//
+// ---------- Public methods ----------
+//
+
+func (crs *CookieRefreshService) Start() {
+	crs.wg.Add(1)
+	go crs.refreshLoop()
+}
+
+func (crs *CookieRefreshService) Stop() {
+	close(crs.stopChan)
+	crs.wg.Wait()
+}
+
+func (crs *CookieRefreshService) WaitForCookie() {
+	<-crs.cookieReady
+}
+
+func (crs *CookieRefreshService) GetCurrentCookie() string {
+	crs.cookieMu.RLock()
+	defer crs.cookieMu.RUnlock()
+	return crs.currentCookie
+}
+
+//
+// ---------- Internal core ----------
+//
+
+func (crs *CookieRefreshService) refreshLoop() {
+	defer crs.wg.Done()
+
+	log.Println("🔑 Fetching initial cookie...")
+	fresh, err := crs.FetchFreshCookie()
+	if err != nil {
+		log.Printf("❌ Initial cookie fetch failed: %v", err)
 		return
 	}
-	r.cookieMu.Lock()
-	r.currentCookie = c
-	r.cookieMu.Unlock()
-	r.readyOnce.Do(func() { close(r.readyCh) })
-	log.Println("✅ Initial cookie acquired")
-}
 
-func (r *RefreshService) FetchFreshCookie() (string, error) {
-	attempt := 0
-	delay := CookieRetryDelay
+	crs.cookieMu.Lock()
+	crs.currentCookie = fresh
+	crs.cookieMu.Unlock()
+	close(crs.cookieReady)
+	log.Println("✅ Initial cookie acquired")
+
+	ticker := time.NewTicker(4 * time.Hour)
+	defer ticker.Stop()
+
 	for {
 		select {
-		case <-r.stopCh:
-			return "", fmt.Errorf("stopped")
-		default:
-		}
-
-		attempt++
-		if attempt > 1 {
-			log.Printf("🔄 Cookie fetch retry attempt %d (waiting %v)...", attempt, delay)
-			time.Sleep(delay)
-			delay *= 2
-			if delay > MaxCookieRetryDelay {
-				delay = MaxCookieRetryDelay
+		case <-ticker.C:
+			log.Println("🔄 Automatic cookie refresh cycle started")
+			cookie, err := crs.FetchFreshCookie()
+			if err != nil {
+				log.Printf("⚠️ Cookie refresh failed: %v", err)
+				continue
 			}
-		}
+			crs.cookieMu.Lock()
+			crs.currentCookie = cookie
+			crs.cookieMu.Unlock()
+			log.Println("✅ Cookie refresh completed")
 
-		c, err := r.attemptFetchCookie()
-		if err != nil {
-			log.Printf("⚠️ Cookie fetch attempt %d failed: %v", attempt, err)
-			continue
+		case <-crs.stopChan:
+			return
 		}
-		if strings.Contains(c, "xf_user=") {
-			log.Printf("✅ Successfully fetched fresh cookie with xf_user (attempt %d)", attempt)
-			r.cookieMu.Lock()
-			r.currentCookie = c
-			r.cookieMu.Unlock()
-			return c, nil
-		}
-		log.Printf("❌ Cookie fetch attempt %d missing xf_user — retrying...", attempt)
 	}
 }
 
-func (r *RefreshService) attemptFetchCookie() (string, error) {
-	// Step 1: KiwiFlare
-	log.Println("Step 1: Checking for KiwiFlare challenge...")
-	clearance, err := r.getClearanceToken()
-	if err != nil {
-		return "", fmt.Errorf("clearance token error: %w", err)
+// FetchFreshCookie attempts full login until success.
+func (crs *CookieRefreshService) FetchFreshCookie() (string, error) {
+	attempt := 1
+	for {
+		log.Printf("🔑 Attempting cookie fetch (attempt %d)", attempt)
+		cookie, err := crs.attemptFetchCookie()
+		if err == nil && strings.Contains(cookie, "xf_user=") {
+			log.Printf("✅ Successfully fetched fresh cookie with xf_user (attempt %d)", attempt)
+			return cookie, nil
+		}
+
+		if err != nil {
+			log.Printf("⚠️ Cookie fetch attempt %d failed: %v", attempt, err)
+		} else {
+			log.Printf("⚠️ Cookie fetch attempt %d failed: retry still missing xf_user cookie", attempt)
+		}
+
+		time.Sleep(5 * time.Second)
+		attempt++
 	}
-	if clearance != "" {
+}
+
+// attemptFetchCookie performs one complete login cycle.
+func (crs *CookieRefreshService) attemptFetchCookie() (string, error) {
+	baseURL := fmt.Sprintf("https://%s", crs.domain)
+
+	// Step 1: KiwiFlare clearance
+	log.Println("Step 1: Checking for KiwiFlare challenge...")
+	req, _ := http.NewRequest("GET", baseURL+"/", nil)
+	req.Header.Set("User-Agent", randomUserAgent())
+
+	start := time.Now()
+	resp, err := crs.client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("initial GET failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if crs.debug {
+		log.Printf("📩 [HTTP GET] %s/ -> %d %s", baseURL, resp.StatusCode, resp.Status)
+		for k, v := range resp.Header {
+			for _, val := range v {
+				log.Printf("   ← %s: %s", k, val)
+			}
+		}
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("⏱️ KiwiFlare challenge page loaded in %v", time.Since(start))
+	log.Printf("📄 Body length: %d bytes", len(body))
+
+	if strings.Contains(string(body), "data-sssg-challenge") {
+		auth, err := crs.solveKiwiFlare(body)
+		if err != nil {
+			return "", fmt.Errorf("KiwiFlare solve error: %w", err)
+		}
+		log.Printf("✅ KiwiFlare clearance cookie confirmed: %s...", trimLong(auth, 10))
 		log.Println("✅ KiwiFlare challenge solved")
 		log.Println("⏳ Waiting 2 seconds for cookie propagation...")
 		time.Sleep(2 * time.Second)
 	}
 
-	// Step 2: GET /login
+	// Step 2: Login page
 	log.Println("Step 2: Fetching login page...")
-	loginURL := fmt.Sprintf("https://%s/login/", r.domain)
-	req, _ := http.NewRequest("GET", loginURL, nil)
+	loginURL := fmt.Sprintf("%s/login", baseURL)
+	req, _ = http.NewRequest("GET", loginURL, nil)
 	req.Header.Set("User-Agent", randomUserAgent())
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Pragma", "no-cache")
-	req.URL.RawQuery = fmt.Sprintf("r=%d", rand.Intn(1_000_000))
-
-	resp, err := r.client.Do(req)
+	resp, err = crs.client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to get login page: %w", err)
 	}
 	defer resp.Body.Close()
+
+	body, _ = io.ReadAll(resp.Body)
 	log.Printf("→ Using protocol for login page: %s", resp.Proto)
-
-	body, _ := io.ReadAll(resp.Body)
-	bodyStr := string(body)
-
-	log.Println("⏳ Waiting 1 second before processing login page...")
 	time.Sleep(1 * time.Second)
 
-	// Step 3: Extract CSRF
-	log.Println("Step 3: Extracting CSRF token...")
-	var csrf string
-	for _, pat := range []*regexp.Regexp{
-		regexp.MustCompile(`<html[^>]*data-csrf=["']([^"']+)["']`),
-		regexp.MustCompile(`name="_xfToken" value="([^"]+)"`),
-		regexp.MustCompile(`data-csrf=["']([^"']+)["']`),
-		regexp.MustCompile(`"csrf":"([^"]+)"`),
-		regexp.MustCompile(`XF\.config\.csrf\s*=\s*"([^"]+)"`),
-	} {
-		if m := pat.FindStringSubmatch(bodyStr); len(m) >= 2 {
-			csrf = m[1]
-			break
-		}
+	// Step 3: Extract CSRF token
+	csrfToken := extractCSRF(string(body))
+	if csrfToken == "" {
+		return "", fmt.Errorf("missing CSRF token")
 	}
-	if csrf == "" {
-		log.Printf("⚠️ CSRF token not found. Partial HTML:\n%s", bodyStr[:min(800, len(bodyStr))])
-		return "", fmt.Errorf("CSRF token not found in login page")
-	}
-	log.Printf("✅ Found CSRF token: %s...", csrf[:min(10, len(csrf))])
+	log.Printf("✅ Found CSRF token: %s...", trimLong(csrfToken, 10))
 
-	// Step 4: POST /login/login
-	log.Println("Step 4: Submitting login credentials...")
-	postURL := fmt.Sprintf("https://%s/login/login", r.domain)
-	form := url.Values{
-		"_xfToken":      {csrf},
-		"_xfRequestUri": {"/"},
-		"_xfWithData":   {"1"},
-		"login":         {r.username},
-		"password":      {r.password},
-		"_xfRedirect":   {fmt.Sprintf("https://%s/", r.domain)},
-		"remember":      {"1"},
+	// Step 4: POST login credentials (full browser headers + both redirect fields)
+	loginPost := fmt.Sprintf("%s/login/login", baseURL)
+	data := url.Values{
+		"_xfToken":    {csrfToken},
+		"login":       {crs.username},
+		"password":    {crs.password},
+		"remember":    {"1"},
+		"redirect":    {"/"},
+		"_xfRedirect": {baseURL + "/"},
 	}
 
-	cookieURL, _ := url.Parse(fmt.Sprintf("https://%s/", r.domain))
-	for _, c := range r.client.Jar.Cookies(cookieURL) {
-		c.Domain = strings.TrimPrefix(c.Domain, ".")
-	}
-	r.client.Jar.SetCookies(cookieURL, r.client.Jar.Cookies(cookieURL))
-
-	postReq, _ := http.NewRequest("POST", postURL, strings.NewReader(form.Encode()))
+	postReq, _ := http.NewRequest("POST", loginPost, strings.NewReader(data.Encode()))
 	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	postReq.Header.Set("User-Agent", randomUserAgent())
 	postReq.Header.Set("Referer", loginURL)
-	postReq.Header.Set("Origin", fmt.Sprintf("https://%s", r.domain))
-	postReq.Header.Set("X-XF-Token", csrf)
-	postReq.Header.Set("X-Requested-With", "XMLHttpRequest")
+	postReq.Header.Set("Origin", baseURL)
 	postReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	postReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	postReq.Header.Set("Accept-Encoding", "gzip, deflate")
+	postReq.Header.Set("Accept-Language", "en-US,en;q=0.5")
+	postReq.Header.Set("Connection", "keep-alive")
+	postReq.Header.Set("Upgrade-Insecure-Requests", "1")
 
-	loginResp, err := r.client.Do(postReq)
+	loginResp, err := crs.client.Do(postReq)
 	if err != nil {
 		return "", fmt.Errorf("login POST failed: %w", err)
 	}
 	defer loginResp.Body.Close()
+
 	log.Printf("Login response status: %d", loginResp.StatusCode)
 
-	// Follow redirect if present
-	if loginResp.StatusCode >= 300 && loginResp.StatusCode < 400 {
-		if loc := loginResp.Header.Get("Location"); loc != "" {
-			log.Printf("Following redirect to %s to check for xf_user...", loc)
-			url2 := loc
-			if !strings.HasPrefix(loc, "http") {
-				url2 = fmt.Sprintf("https://%s%s", r.domain, loc)
-			}
-			time.Sleep(1 * time.Second)
-			if fr, err := r.client.Get(url2); err == nil {
-				fr.Body.Close()
-				time.Sleep(500 * time.Millisecond)
-			}
+	// 🧩 Diagnostic: if status 200, dump first KB of body for debugging
+	if loginResp.StatusCode == 200 {
+		bodyBytes, _ := io.ReadAll(loginResp.Body)
+		snippet := string(bodyBytes)
+		if len(snippet) > 1000 {
+			snippet = snippet[:1000]
 		}
+		log.Printf("🧩 Login 200 body snippet:\n%s", snippet)
+		// Recreate reader for downstream reuse
+		loginResp.Body = io.NopCloser(strings.NewReader(string(bodyBytes)))
 	}
 
-	// Decode response (gzip)
-	var reader io.ReadCloser
-	if loginResp.Header.Get("Content-Encoding") == "gzip" {
-		gz, ge := gzip.NewReader(loginResp.Body)
-		if ge == nil {
-			reader = gz
-			defer gz.Close()
-		} else {
-			reader = io.NopCloser(loginResp.Body)
-		}
-	} else {
-		reader = io.NopCloser(loginResp.Body)
-	}
-	respHTML, _ := io.ReadAll(reader)
-	if strings.Contains(string(respHTML), `data-logged-in="false"`) {
-		log.Println("⚠️ HTML indicates still logged out (data-logged-in=false)")
-		time.Sleep(1 * time.Second)
-		return r.retryWithFreshCSRF()
-	}
-
-	// Wait before extracting cookies
-	log.Println("⏳ Waiting 2 seconds for XenForo to issue cookies...")
 	time.Sleep(2 * time.Second)
 
-	// Normalize and show cookies
-	cookies := r.client.Jar.Cookies(cookieURL)
+	// Step 5: Check cookies in jar
+	cookieURL, _ := url.Parse(baseURL)
+	cookies := crs.client.Jar.Cookies(cookieURL)
+	hasXfUser := false
 	for _, c := range cookies {
-		c.Domain = strings.TrimPrefix(c.Domain, ".")
-		log.Printf("Cookie after login: %s=%s", c.Name, c.Value)
-	}
-	r.client.Jar.SetCookies(cookieURL, cookies)
-
-	want := map[string]bool{
-		"xf_user":        true,
-		"xf_toggle":      true,
-		"xf_csrf":        true,
-		"xf_session":     true,
-		"sssg_clearance": true,
-	}
-	var parts []string
-	hasUser := false
-	for _, c := range cookies {
-		if want[c.Name] {
-			parts = append(parts, fmt.Sprintf("%s=%s", c.Name, c.Value))
-			if c.Name == "xf_user" {
-				hasUser = true
-			}
+		log.Printf("🍪 [After Login POST] %s=%s", c.Name, trimLong(c.Value, 10))
+		if c.Name == "xf_user" {
+			hasXfUser = true
 		}
 	}
-	if !hasUser {
-		return "", fmt.Errorf("xf_user cookie missing — authentication failed, will retry")
+
+	// 🔁 Follow redirect manually if missing xf_user
+	if !hasXfUser {
+		log.Println("🧭 Following post-login redirect manually to capture xf_user...")
+		time.Sleep(1 * time.Second)
+		followReq, _ := http.NewRequest("GET", baseURL+"/", nil)
+		followReq.Header.Set("User-Agent", randomUserAgent())
+		followReq.Header.Set("Referer", baseURL+"/login")
+		followReq.Header.Set("Origin", baseURL)
+		followReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		followReq.Header.Set("Accept-Language", "en-US,en;q=0.5")
+		followResp, ferr := crs.client.Do(followReq)
+		if ferr != nil {
+			log.Printf("⚠️ Redirect follow failed: %v", ferr)
+		} else {
+			followResp.Body.Close()
+			log.Printf("📩 [HTTP GET] %s/ -> %s", baseURL, followResp.Status)
+		}
+		time.Sleep(1 * time.Second)
+
+		cookies = crs.client.Jar.Cookies(cookieURL)
+		for _, c := range cookies {
+			log.Printf("🍪 [After Redirect] %s=%s", c.Name, trimLong(c.Value, 10))
+			if c.Name == "xf_user" {
+				hasXfUser = true
+			}
+		}
+		if hasXfUser {
+			log.Println("✅ xf_user cookie acquired after redirect follow")
+		} else {
+			log.Println("⚠️ xf_user cookie still missing after redirect follow")
+		}
+	}
+
+	// 🧭 Secondary check — trigger /account/ to issue xf_user if still missing
+	if !hasXfUser {
+		log.Println("🧭 Performing secondary authenticated fetch to /account/ to trigger xf_user...")
+		time.Sleep(1 * time.Second)
+		accountReq, _ := http.NewRequest("GET", baseURL+"/account/", nil)
+		accountReq.Header.Set("User-Agent", randomUserAgent())
+		accountReq.Header.Set("Referer", baseURL+"/login")
+		accountReq.Header.Set("Origin", baseURL)
+		accountReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+		accountReq.Header.Set("Accept-Language", "en-US,en;q=0.5")
+		accountResp, accErr := crs.client.Do(accountReq)
+		if accErr != nil {
+			log.Printf("⚠️ Account fetch failed: %v", accErr)
+		} else {
+			accountResp.Body.Close()
+			log.Printf("📩 [HTTP GET] %s/account/ -> %s", baseURL, accountResp.Status)
+		}
+		time.Sleep(1 * time.Second)
+
+		cookies = crs.client.Jar.Cookies(cookieURL)
+		for _, c := range cookies {
+			log.Printf("🍪 [After /account/] %s=%s", c.Name, trimLong(c.Value, 10))
+			if c.Name == "xf_user" {
+				hasXfUser = true
+			}
+		}
+		if hasXfUser {
+			log.Println("✅ xf_user cookie acquired after /account/ fetch")
+		} else {
+			log.Println("⚠️ xf_user cookie still missing after /account/ fetch")
+			return "", fmt.Errorf("xf_user still missing after all follow-ups")
+		}
+	}
+
+	// Build final cookie string
+	var parts []string
+	for _, c := range cookies {
+		if strings.HasPrefix(c.Name, "xf_") || c.Name == "sssg_clearance" {
+			parts = append(parts, fmt.Sprintf("%s=%s", c.Name, c.Value))
+		}
 	}
 	return strings.Join(parts, "; "), nil
 }
 
-func randomUserAgent() string {
-	agents := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-		"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+//
+// ---------- Utilities ----------
+//
+
+func extractCSRF(body string) string {
+	reList := []*regexp.Regexp{
+		regexp.MustCompile(`data-csrf=["']([^"']+)["']`),
+		regexp.MustCompile(`"csrf":"([^"]+)"`),
+		regexp.MustCompile(`XF\.config\.csrf\s*=\s*"([^"]+)"`),
 	}
-	return agents[rand.Intn(len(agents))]
+	for _, re := range reList {
+		if m := re.FindStringSubmatch(body); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func trimLong(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
 	}
-	return b
+	return s
+}
+
+func randomUserAgent() string {
+	uas := []string{
+		"Mozilla/5.0 (X11; Linux x86_64) Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/605.1.15",
+	}
+	return uas[rand.Intn(len(uas))]
+}
+
+//
+// ---------- KiwiFlare Solver ----------
+//
+
+func (crs *CookieRefreshService) solveKiwiFlare(body []byte) (string, error) {
+	html := string(body)
+	challenge := regexp.MustCompile(`data-sssg-challenge=["']([^"']+)["']`).FindStringSubmatch(html)
+	difficultyStr := regexp.MustCompile(`data-sssg-difficulty=["'](\d+)["']`).FindStringSubmatch(html)
+	if len(challenge) < 2 || len(difficultyStr) < 2 {
+		return "", fmt.Errorf("missing challenge or difficulty")
+	}
+	salt := challenge[1]
+	diff, _ := strconv.Atoi(difficultyStr[1])
+	log.Printf("Solving KiwiFlare challenge (difficulty=%d)", diff)
+
+	nonce := rand.Int63()
+	start := time.Now()
+	for {
+		nonce++
+		input := fmt.Sprintf("%s%d", salt, nonce)
+		hash := sha256.Sum256([]byte(input))
+
+		fullBytes := diff / 8
+		remainder := diff % 8
+		valid := true
+		for i := 0; i < fullBytes; i++ {
+			if hash[i] != 0 {
+				valid = false
+				break
+			}
+		}
+		if valid && remainder > 0 && fullBytes < len(hash) {
+			mask := byte(0xFF << (8 - remainder))
+			if hash[fullBytes]&mask != 0 {
+				valid = false
+			}
+		}
+		if valid {
+			log.Printf("✅ Solved KiwiFlare PoW: salt=%s nonce=%d difficulty=%d", trimLong(salt, 16), nonce, diff)
+			elapsed := time.Since(start)
+			if elapsed < 2*time.Second {
+				time.Sleep(2*time.Second - elapsed)
+			}
+			break
+		}
+	}
+
+	submit := fmt.Sprintf("%s/.sssg/api/answer", baseURL(crs.domain))
+	form := url.Values{"a": {salt}, "b": {fmt.Sprintf("%d", nonce)}}
+	req, _ := http.NewRequest("POST", submit, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", randomUserAgent())
+
+	resp, err := crs.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	bodyResp, _ := io.ReadAll(resp.Body)
+
+	var parsed map[string]any
+	_ = json.Unmarshal(bodyResp, &parsed)
+	if auth, ok := parsed["auth"].(string); ok {
+		return auth, nil
+	}
+	return "", fmt.Errorf("no auth field in KiwiFlare response")
+}
+
+func baseURL(domain string) string {
+	return fmt.Sprintf("https://%s", domain)
 }
