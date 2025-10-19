@@ -1,4 +1,4 @@
-module sneedchat-discord-bridge
+module local/sneedchatbridge
 
 go 1.19
 

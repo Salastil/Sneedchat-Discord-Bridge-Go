@@ -41,7 +41,6 @@ go version  # Should show 1.19 or higher
 
 ```bash
 # Create installation directory
-sudo mkdir -p /opt/sneedchat-bridge
 cd /opt/sneedchat-bridge
 
 # Clone repository 
