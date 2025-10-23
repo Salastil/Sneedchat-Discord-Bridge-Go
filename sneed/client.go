@@ -226,8 +226,16 @@ func (c *Client) handleDisconnect() {
 	}
 
 	log.Println("🟢 Reconnected successfully")
+
+	// 🚦 Allow websocket handshake to stabilize
+	time.Sleep(2 * time.Second)
+
+	// 🔁 Re-join chat room and verify connection
 	c.joinRoom()
+	c.Send("/ping")
+	log.Printf("🔁 Rejoined Sneedchat room %d after reconnect", c.roomID)
 }
+
 
 func (c *Client) Disconnect() {
 	close(c.stopCh)
