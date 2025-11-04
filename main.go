@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"local/sneedchatbridge/config"
 	"local/sneedchatbridge/cookie"
@@ -29,7 +28,7 @@ func main() {
 	log.Printf("Using Sneedchat room ID: %d", cfg.SneedchatRoomID)
 	log.Printf("Bridge username: %s", cfg.BridgeUsername)
 
-	// Cookie service
+	// Cookie service (now handles its own refresh loop)
 	cookieSvc, err := cookie.NewCookieRefreshService(cfg.BridgeUsername, cfg.BridgePassword, "kiwifarms.st")
 	if err != nil {
 		log.Fatalf("Failed to create cookie service: %v", err)
@@ -52,20 +51,6 @@ func main() {
 		log.Fatalf("Failed to start Discord bridge: %v", err)
 	}
 	log.Println("🌉 Discord-Sneedchat Bridge started successfully")
-
-	// Background 4h refresh loop
-	go func() {
-		t := time.NewTicker(4 * time.Hour)
-		defer t.Stop()
-		for range t.C {
-			log.Println("🔄 Starting automatic cookie refresh")
-			if _, err := cookieSvc.FetchFreshCookie(); err != nil {
-				log.Printf("⚠️ Cookie refresh failed: %v", err)
-				continue
-			}
-			log.Println("✅ Cookie refresh completed")
-		}
-	}()
 
 	// Connect to Sneedchat
 	go func() {

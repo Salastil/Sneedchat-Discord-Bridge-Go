@@ -70,6 +70,8 @@ func (s *CookieRefreshService) Start() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		
+		// Initial fetch
 		log.Println("⏳ Fetching initial cookie...")
 		c, err := s.FetchFreshCookie()
 		if err != nil {
@@ -81,6 +83,30 @@ func (s *CookieRefreshService) Start() {
 		s.currentCookie = c
 		s.mu.Unlock()
 		s.readyOnce.Do(func() { close(s.readyCh) })
+		log.Println("✅ Initial cookie obtained")
+		
+		// Continuous refresh loop
+		ticker := time.NewTicker(CookieRefreshInterval)
+		defer ticker.Stop()
+		
+		for {
+			select {
+			case <-ticker.C:
+				log.Println("🔄 Auto-refreshing cookie...")
+				newCookie, err := s.FetchFreshCookie()
+				if err != nil {
+					log.Printf("⚠️ Cookie auto-refresh failed: %v", err)
+					continue
+				}
+				s.mu.Lock()
+				s.currentCookie = newCookie
+				s.mu.Unlock()
+				log.Println("✅ Cookie auto-refresh successful")
+			case <-s.stopCh:
+				log.Println("Cookie refresh service stopping")
+				return
+			}
+		}
 	}()
 }
 
@@ -98,6 +124,7 @@ func (s *CookieRefreshService) GetCurrentCookie() string {
 	defer s.mu.RUnlock()
 	return s.currentCookie
 }
+
 func (s *CookieRefreshService) FetchFreshCookie() (string, error) {
 	if s.debug {
 		log.Println("💡 Stage: Starting FetchFreshCookie")

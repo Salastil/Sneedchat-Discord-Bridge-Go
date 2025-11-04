@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	ProcessedCacheSize     = 250
+	ProcessedCacheSize     = 1000  // Increased from 250
 	ReconnectInterval      = 7 * time.Second
 	MappingCacheSize       = 1000
 	MappingCleanupInterval = 5 * time.Minute
@@ -218,24 +218,44 @@ func (c *Client) handleDisconnect() {
 		c.OnDisconnect()
 	}
 
-	time.Sleep(ReconnectInterval)
+	// Reconnection loop with exponential backoff
+	delay := ReconnectInterval
+	maxDelay := 2 * time.Minute
+	attempt := 0
 
-	if err := c.Connect(); err != nil {
-		log.Printf("Reconnect attempt failed: %v", err)
-		return
+	for {
+		select {
+		case <-c.stopCh:
+			log.Println("Reconnection cancelled - bridge stopping")
+			return
+		case <-time.After(delay):
+			attempt++
+			log.Printf("🔄 Reconnection attempt #%d...", attempt)
+			
+			if err := c.Connect(); err != nil {
+				log.Printf("⚠️ Reconnect attempt #%d failed: %v", attempt, err)
+				
+				// Exponential backoff
+				delay *= 2
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+
+			log.Println("🟢 Reconnected successfully")
+
+			// Allow websocket to stabilize
+			time.Sleep(2 * time.Second)
+
+			// Re-join room
+			c.joinRoom()
+			c.Send("/ping")
+			log.Printf("📍 Rejoined Sneedchat room %d after reconnect", c.roomID)
+			return
+		}
 	}
-
-	log.Println("🟢 Reconnected successfully")
-
-	// 🚦 Allow websocket handshake to stabilize
-	time.Sleep(2 * time.Second)
-
-	// 🔁 Re-join chat room and verify connection
-	c.joinRoom()
-	c.Send("/ping")
-	log.Printf("🔁 Rejoined Sneedchat room %d after reconnect", c.roomID)
 }
-
 
 func (c *Client) Disconnect() {
 	close(c.stopCh)
@@ -378,9 +398,18 @@ func (c *Client) isProcessed(id int) bool {
 func (c *Client) addToProcessed(id int) {
 	c.processedMu.Lock()
 	defer c.processedMu.Unlock()
+	
 	c.processedMessageIDs = append(c.processedMessageIDs, id)
+	
+	// Hard cap: keep only the most recent 1000 messages (FIFO)
 	if len(c.processedMessageIDs) > ProcessedCacheSize {
-		c.processedMessageIDs = c.processedMessageIDs[1:]
+		excess := len(c.processedMessageIDs) - ProcessedCacheSize
+		c.processedMessageIDs = c.processedMessageIDs[excess:]
+		
+		// Log when significant eviction happens
+		if excess > 50 {
+			log.Printf("⚠️ Processed message cache full, evicted %d old entries", excess)
+		}
 	}
 }
 
@@ -407,6 +436,6 @@ func ReplaceBridgeMention(content, bridgeUsername, pingID string) string {
 	if bridgeUsername == "" || pingID == "" {
 		return content
 	}
-	pat := regexp.MustCompile(fmt.Sprintf(`(?i)@%s(?:\\W|$)`, regexp.QuoteMeta(bridgeUsername)))
+	pat := regexp.MustCompile(fmt.Sprintf(`(?i)@%s(?:\W|$)`, regexp.QuoteMeta(bridgeUsername)))
 	return pat.ReplaceAllString(content, fmt.Sprintf("<@%s>", pingID))
 }
