@@ -1,0 +1,159 @@
+name: Build & Release
+on:
+  push:
+    branches: ["master"]
+    tags:
+      - 'v*.*'
+
+jobs:
+  build-latest:
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'branch'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.22"
+          
+      - name: Build Binary
+        run: |
+          go mod tidy
+          go build -o Sneedchat-Discord-Bridge .
+      
+      - name: Delete Previous Latest Release
+        continue-on-error: true
+        env:
+          GITEA_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          curl -X DELETE \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            "https://git.salastil.com/api/v1/repos/Salastil/Sneedchat-Discord-Bridge-Go/releases/tags/latest"
+      
+      - name: Delete Latest Tag
+        continue-on-error: true
+        run: |
+          git push origin :refs/tags/latest || true
+          
+      - name: Create Latest Tag
+        run: |
+          git config user.name "Gitea Actions"
+          git config user.email "actions@gitea.local"
+          git tag latest
+          git push origin latest
+          
+      - name: Create Latest Release and Upload Binary
+        env:
+          GITEA_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          set -x
+          
+          # Verify token exists
+          if [ -z "$GITEA_TOKEN" ]; then
+            echo "ERROR: CI_TOKEN secret is not set!"
+            exit 1
+          fi
+          
+          # Create release
+          RESPONSE=$(curl -X POST \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tag_name": "latest",
+              "name": "Latest Build (Development)",
+              "body": "Automated build from master branch commit ${{ github.sha }}",
+              "draft": false,
+              "prerelease": true
+            }' \
+            "https://git.salastil.com/api/v1/repos/Salastil/Sneedchat-Discord-Bridge-Go/releases")
+          
+          echo "Create release response: $RESPONSE"
+          
+          # Extract release ID
+          RELEASE_ID=$(echo "$RESPONSE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          
+          echo "Release ID: $RELEASE_ID"
+          
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Failed to create release or extract release ID"
+            exit 1
+          fi
+          
+          # Upload binary
+          curl -X POST \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @Sneedchat-Discord-Bridge \
+            "https://git.salastil.com/api/v1/repos/Salastil/Sneedchat-Discord-Bridge-Go/releases/$RELEASE_ID/assets?name=Sneedchat-Discord-Bridge"
+
+  version-release:
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.22"
+          
+      - name: Build Multi-Platform Binaries
+        run: |
+          mkdir -p dist
+          go mod tidy
+          GOOS=linux   GOARCH=amd64 go build -o dist/Sneedchat-Discord-Bridge-linux-amd64 .
+          GOOS=linux   GOARCH=arm64 go build -o dist/Sneedchat-Discord-Bridge-linux-arm64 .
+          GOOS=windows GOARCH=amd64 go build -o dist/Sneedchat-Discord-Bridge-windows-amd64.exe .
+          GOOS=darwin  GOARCH=amd64 go build -o dist/Sneedchat-Discord-Bridge-darwin-amd64 .
+          GOOS=darwin  GOARCH=arm64 go build -o dist/Sneedchat-Discord-Bridge-darwin-arm64 .
+          
+      - name: Create Version Release and Upload Binaries
+        env:
+          GITEA_TOKEN: ${{ secrets.CI_TOKEN }}
+        run: |
+          set -x
+          
+          # Verify token exists
+          if [ -z "$GITEA_TOKEN" ]; then
+            echo "ERROR: CI_TOKEN secret is not set!"
+            exit 1
+          fi
+          
+          # Create release
+          RESPONSE=$(curl -X POST \
+            -H "Authorization: token ${GITEA_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "tag_name": "${{ github.ref_name }}",
+              "name": "Release ${{ github.ref_name }}",
+              "body": "Release ${{ github.ref_name }}",
+              "draft": false,
+              "prerelease": false
+            }' \
+            "https://git.salastil.com/api/v1/repos/Salastil/Sneedchat-Discord-Bridge-Go/releases")
+          
+          echo "Create release response: $RESPONSE"
+          
+          # Extract release ID
+          RELEASE_ID=$(echo "$RESPONSE" | grep -o '"id":[0-9]*' | head -1 | grep -o '[0-9]*')
+          
+          echo "Release ID: $RELEASE_ID"
+          
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Failed to create release or extract release ID"
+            exit 1
+          fi
+          
+          # Upload all binaries
+          for file in dist/*; do
+            filename=$(basename "$file")
+            echo "Uploading $filename..."
+            curl -X POST \
+              -H "Authorization: token ${GITEA_TOKEN}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$file" \
+              "https://git.salastil.com/api/v1/repos/Salastil/Sneedchat-Discord-Bridge-Go/releases/$RELEASE_ID/assets?name=$filename"
+          done

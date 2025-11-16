@@ -14,7 +14,7 @@ A high-performance bridge written in Go that synchronizes messages between Kiwi 
 
 **Typical resource usage:**
 - **CPU**: Efficient, easily handled by a Raspberry Pi, a few % on cpu usage at heavy load. 
-- **Memory**: 50-70 MB at full load in a busy channel
+- **Memory**: 10-15 MB at full load in a busy channel
 - **Network**: Minimal (< 1 MB/minute) except when uploading attachments
 
 ## Requirements
