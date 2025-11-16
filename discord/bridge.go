@@ -190,12 +190,16 @@ func (b *Bridge) onDiscordMessageCreate(s *discordgo.Session, m *discordgo.Messa
 		if err != nil {
 			return
 		}
+
 		ct := strings.ToLower(att.ContentType)
-		if strings.HasPrefix(ct, "video") || strings.HasSuffix(strings.ToLower(att.Filename), ".mp4") ||
-			strings.HasSuffix(strings.ToLower(att.Filename), ".webm") {
-			attachmentsBB = append(attachmentsBB, fmt.Sprintf("[url=%s][video]%s[/video][/url]", url, url))
+
+		// Images → wrap inside clickable URL with an image preview
+		if strings.HasPrefix(ct, "image/") {
+			attachmentsBB = append(attachmentsBB,
+				fmt.Sprintf("[url=%s][img]%s[/img][/url]", url, url))
 		} else {
-			attachmentsBB = append(attachmentsBB, fmt.Sprintf("[url=%s][img]%s[/img][/url]", url, url))
+			// Everything else → plain URL (videos, archives, PDFs, audio, etc)
+			attachmentsBB = append(attachmentsBB, url)
 		}
 	}
 	combined := contentText
