@@ -19,7 +19,7 @@ A high-performance bridge written in Go that synchronizes messages between Kiwi 
 
 ## Requirements
 
-- **Go 1.19 or higher**
+- **Go 1.23 or higher**
 - **Discord Bot Token** with proper permissions
 - **Discord Webhook URL**
 - **Kiwi Farms account** with Sneedchat access
@@ -34,7 +34,7 @@ sudo apt update
 sudo apt install golang git
 
 # Verify installation
-go version  # Should show 1.19 or higher
+go version  # Should show 1.23 or higher
 ```
 
 ### 2. Clone and Build
