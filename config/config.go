@@ -10,16 +10,17 @@ import (
 )
 
 type Config struct {
-	DiscordBotToken   string
-	DiscordChannelID  string
-	DiscordGuildID    string
-	DiscordWebhookURL string
-	SneedchatRoomID   int
-	BridgeUsername    string
-	BridgePassword    string
-	BridgeUserID      int
-	DiscordPingUserID string
-	Debug             bool
+	DiscordBotToken    string
+	DiscordChannelID   string
+	DiscordGuildID     string
+	DiscordWebhookURL  string
+	SneedchatRoomID    int
+	MediaUploadService string
+	BridgeUsername     string
+	BridgePassword     string
+	BridgeUserID       int
+	DiscordPingUserID  string
+	Debug              bool
 }
 
 func Load(envFile string) (*Config, error) {
@@ -27,13 +28,17 @@ func Load(envFile string) (*Config, error) {
 		log.Printf("Warning: error loading %s: %v", envFile, err)
 	}
 	cfg := &Config{
-		DiscordBotToken:   os.Getenv("DISCORD_BOT_TOKEN"),
-		DiscordChannelID:  os.Getenv("DISCORD_CHANNEL_ID"),
-		DiscordGuildID:    os.Getenv("DISCORD_GUILD_ID"),
-		DiscordWebhookURL: os.Getenv("DISCORD_WEBHOOK_URL"),
-		BridgeUsername:    os.Getenv("BRIDGE_USERNAME"),
-		BridgePassword:    os.Getenv("BRIDGE_PASSWORD"),
-		DiscordPingUserID: os.Getenv("DISCORD_PING_USER_ID"),
+		DiscordBotToken:    os.Getenv("DISCORD_BOT_TOKEN"),
+		DiscordChannelID:   os.Getenv("DISCORD_CHANNEL_ID"),
+		DiscordGuildID:     os.Getenv("DISCORD_GUILD_ID"),
+		DiscordWebhookURL:  os.Getenv("DISCORD_WEBHOOK_URL"),
+		MediaUploadService: os.Getenv("MEDIA_UPLOAD_SERVICE"),
+		BridgeUsername:     os.Getenv("BRIDGE_USERNAME"),
+		BridgePassword:     os.Getenv("BRIDGE_PASSWORD"),
+		DiscordPingUserID:  os.Getenv("DISCORD_PING_USER_ID"),
+	}
+	if cfg.MediaUploadService == "" {
+		cfg.MediaUploadService = "litterbox"
 	}
 	roomID, err := strconv.Atoi(os.Getenv("SNEEDCHAT_ROOM_ID"))
 	if err != nil {

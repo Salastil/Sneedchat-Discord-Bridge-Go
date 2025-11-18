@@ -1,34 +1,41 @@
 package discord
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/bwmarrin/discordgo"
 	"local/sneedchatbridge/config"
+	"local/sneedchatbridge/media"
 	"local/sneedchatbridge/sneed"
 	"local/sneedchatbridge/utils"
 )
 
 const (
-	MaxAttachments          = 4
-	LitterboxTTL            = "72h"
-	ProcessedCacheSize      = 250
-	MappingCacheSize        = 1000
-	MappingMaxAge           = 1 * time.Hour
-	MappingCleanupInterval  = 5 * time.Minute
-	QueuedMessageTTL        = 90 * time.Second
-	OutageUpdateInterval    = 10 * time.Second
-	OutboundMatchWindow     = 60 * time.Second
+	MaxAttachments              = 4
+	ProcessedCacheSize          = 250
+	MappingCacheSize            = 1000
+	MappingMaxAge               = 1 * time.Hour
+	MappingCleanupInterval      = 5 * time.Minute
+	QueuedMessageTTL            = 90 * time.Second
+	OutageUpdateInterval        = 10 * time.Second
+	OutboundMatchWindow         = 60 * time.Second
+	OutageEmbedColorActive      = 0xF1C40F
+	OutageEmbedColorFixed       = 0x2ECC71
+	UploadStatusColorPending    = 0x3498DB
+	UploadStatusColorSuccess    = 0x2ECC71
+	UploadStatusColorFailed     = 0xE74C3C
+	UploadDeliveryTimeout       = 2 * time.Minute
+	UploadStatusCleanupDelay    = 15 * time.Second
+	UploadStatusFailureLifetime = 60 * time.Second
 )
 
 type OutboundEntry struct {
@@ -46,10 +53,10 @@ type QueuedMessage struct {
 }
 
 type Bridge struct {
-	cfg       *config.Config
-	session   *discordgo.Session
-	sneed     *sneed.Client
-	httpClient *http.Client
+	cfg      *config.Config
+	session  *discordgo.Session
+	sneed    *sneed.Client
+	mediaSvc media.Service
 
 	sneedToDiscord *utils.BoundedMap
 	discordToSneed *utils.BoundedMap
@@ -61,9 +68,10 @@ type Bridge struct {
 	queuedOutbound   []QueuedMessage
 	queuedOutboundMu sync.Mutex
 
-	outageMessages   []*discordgo.Message
-	outageMessagesMu sync.Mutex
-	outageStart      time.Time
+	outageNotices       []*discordgo.Message
+	outageActiveMessage *discordgo.Message
+	outageMessagesMu    sync.Mutex
+	outageStart         time.Time
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -74,18 +82,22 @@ func NewBridge(cfg *config.Config, sneedClient *sneed.Client) (*Bridge, error) {
 	if err != nil {
 		return nil, err
 	}
+	mediaSvc, err := media.NewService(cfg.MediaUploadService, &http.Client{Timeout: 60 * time.Second})
+	if err != nil {
+		return nil, err
+	}
 	b := &Bridge{
-		cfg:             cfg,
-		session:         s,
-		sneed:           sneedClient,
-		httpClient:      &http.Client{Timeout: 60 * time.Second},
-		sneedToDiscord:  utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
-		discordToSneed:  utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
-		sneedUsernames:  utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
-		recentOutbound:  make([]OutboundEntry, 0, ProcessedCacheSize),
-		queuedOutbound:  make([]QueuedMessage, 0),
-		outageMessages:  make([]*discordgo.Message, 0),
-		stopCh:          make(chan struct{}),
+		cfg:            cfg,
+		session:        s,
+		sneed:          sneedClient,
+		mediaSvc:       mediaSvc,
+		sneedToDiscord: utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
+		discordToSneed: utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
+		sneedUsernames: utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
+		recentOutbound: make([]OutboundEntry, 0, ProcessedCacheSize),
+		queuedOutbound: make([]QueuedMessage, 0),
+		outageNotices:  make([]*discordgo.Message, 0),
+		stopCh:         make(chan struct{}),
 	}
 
 	// hook Sneed client callbacks
@@ -182,13 +194,39 @@ func (b *Bridge) onDiscordMessageCreate(s *discordgo.Session, m *discordgo.Messa
 	}
 
 	var attachmentsBB []string
+	var statusMsg *discordgo.Message
+	var statusErr error
+	if len(m.Attachments) > 0 {
+		mention := fmt.Sprintf("<@%s>", m.Author.ID)
+		statusMsg, statusErr = b.sendUploadStatusMessage(m.ChannelID, mention, len(m.Attachments))
+		if statusErr != nil {
+			log.Printf("⚠️ Failed to send upload status message: %v", statusErr)
+		}
+	}
 	if len(m.Attachments) > MaxAttachments {
 		return
 	}
-	for _, att := range m.Attachments {
-		url, err := b.uploadToLitterbox(att.URL, att.Filename)
+	ctx := context.Background()
+	for idx, att := range m.Attachments {
+		if statusMsg != nil {
+			desc := fmt.Sprintf("Uploading attachment %d/%d: `%s`", idx+1, len(m.Attachments), att.Filename)
+			b.editUploadStatusMessage(statusMsg.ChannelID, statusMsg.ID, b.uploadStatusTitle(""), desc, UploadStatusColorPending)
+		}
+		url, statusCode, err := b.mediaSvc.Upload(ctx, att)
 		if err != nil {
+			if statusMsg != nil {
+				failureDesc := fmt.Sprintf("Failed to upload `%s`: %v", att.Filename, err)
+				if statusCode > 0 {
+					failureDesc = fmt.Sprintf("%s\n%s response: HTTP %d", failureDesc, b.mediaServiceDisplayName(), statusCode)
+				}
+				b.editUploadStatusMessage(statusMsg.ChannelID, statusMsg.ID, b.uploadStatusTitle("failed"), failureDesc, UploadStatusColorFailed)
+				b.scheduleUploadStatusDeletion(statusMsg.ChannelID, statusMsg.ID, UploadStatusFailureLifetime)
+			}
 			return
+		}
+		if statusMsg != nil {
+			desc := fmt.Sprintf("Uploaded %d/%d: `%s` (HTTP %d)", idx+1, len(m.Attachments), att.Filename, statusCode)
+			b.editUploadStatusMessage(statusMsg.ChannelID, statusMsg.ID, b.uploadStatusTitle(""), desc, UploadStatusColorPending)
 		}
 
 		ct := strings.ToLower(att.ContentType)
@@ -210,10 +248,11 @@ func (b *Bridge) onDiscordMessageCreate(s *discordgo.Session, m *discordgo.Messa
 		combined += strings.Join(attachmentsBB, "\n")
 	}
 
+	discordMsgID := parseMessageID(m.ID)
 	if b.sneed.Send(combined) {
 		b.recentOutboundMu.Lock()
 		b.recentOutbound = append(b.recentOutbound, OutboundEntry{
-			DiscordID: parseMessageID(m.ID),
+			DiscordID: discordMsgID,
 			Content:   combined,
 			Timestamp: time.Now(),
 			Mapped:    false,
@@ -222,15 +261,23 @@ func (b *Bridge) onDiscordMessageCreate(s *discordgo.Session, m *discordgo.Messa
 			b.recentOutbound = b.recentOutbound[1:]
 		}
 		b.recentOutboundMu.Unlock()
+		if statusMsg != nil {
+			b.editUploadStatusMessage(statusMsg.ChannelID, statusMsg.ID, b.uploadStatusTitle(""), "Uploads complete, awaiting Sneedchat confirmation…", UploadStatusColorPending)
+			go b.awaitSneedConfirmation(discordMsgID, statusMsg.ChannelID, statusMsg.ID)
+		}
 	} else {
 		b.queuedOutboundMu.Lock()
 		b.queuedOutbound = append(b.queuedOutbound, QueuedMessage{
 			Content:   combined,
 			ChannelID: m.ChannelID,
 			Timestamp: time.Now(),
-			DiscordID: parseMessageID(m.ID),
+			DiscordID: discordMsgID,
 		})
 		b.queuedOutboundMu.Unlock()
+		if statusMsg != nil {
+			b.editUploadStatusMessage(statusMsg.ChannelID, statusMsg.ID, b.uploadStatusTitle("queued"), "Uploads succeeded but Sneedchat is unavailable. Message queued for delivery once the bridge reconnects.", UploadStatusColorPending)
+			b.scheduleUploadStatusDeletion(statusMsg.ChannelID, statusMsg.ID, UploadStatusFailureLifetime)
+		}
 	}
 }
 
@@ -348,12 +395,15 @@ func (b *Bridge) handleSneedDelete(sneedID int) {
 func (b *Bridge) onSneedConnect() {
 	log.Println("🟢 Sneedchat connected")
 	b.session.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "online"})
+	queued := b.queuedMessageCount()
+	b.finishOutageNotification(queued)
 	go b.flushQueuedMessages()
 }
 
 func (b *Bridge) onSneedDisconnect() {
 	log.Println("🔴 Sneedchat disconnected")
 	b.session.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "idle"})
+	b.startOutageNotificationLoop()
 }
 
 func (b *Bridge) flushQueuedMessages() {
@@ -391,6 +441,125 @@ func (b *Bridge) flushQueuedMessages() {
 	}
 }
 
+func (b *Bridge) queuedMessageCount() int {
+	b.queuedOutboundMu.Lock()
+	defer b.queuedOutboundMu.Unlock()
+	return len(b.queuedOutbound)
+}
+
+func (b *Bridge) startOutageNotificationLoop() {
+	b.outageMessagesMu.Lock()
+	alreadyRunning := !b.outageStart.IsZero()
+	if !alreadyRunning {
+		b.outageStart = time.Now()
+		go b.outageNotificationLoop()
+	}
+	b.outageMessagesMu.Unlock()
+}
+
+func (b *Bridge) outageNotificationLoop() {
+	if !b.updateOutageMessage() {
+		return
+	}
+	ticker := time.NewTicker(OutageUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if !b.updateOutageMessage() {
+				return
+			}
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
+func (b *Bridge) updateOutageMessage() bool {
+	b.outageMessagesMu.Lock()
+	start := b.outageStart
+	existing := b.outageActiveMessage
+	b.outageMessagesMu.Unlock()
+
+	if start.IsZero() {
+		return false
+	}
+
+	duration := formatDuration(time.Since(start))
+	queued := b.queuedMessageCount()
+	desc := fmt.Sprintf("Connection lost **%s** ago.\n%d queued Discord message(s) will be sent automatically once Sneedchat returns.", duration, queued)
+
+	if existing == nil {
+		msg, err := b.sendOutageEmbed("Sneedchat outage", desc, OutageEmbedColorActive)
+		if err != nil {
+			log.Printf("❌ Failed to send outage notification: %v", err)
+			return true
+		}
+		b.outageMessagesMu.Lock()
+		b.outageActiveMessage = msg
+		toDelete := b.swapOutageNoticesLocked(msg)
+		b.outageMessagesMu.Unlock()
+		b.deleteOutageMessages(toDelete)
+	} else {
+		if err := b.editOutageEmbed(existing.ID, "Sneedchat outage", desc, OutageEmbedColorActive); err != nil {
+			log.Printf("❌ Failed to update outage notification: %v", err)
+		}
+	}
+
+	return true
+}
+
+func (b *Bridge) finishOutageNotification(queued int) {
+	b.outageMessagesMu.Lock()
+	start := b.outageStart
+	b.outageStart = time.Time{}
+	existing := b.outageActiveMessage
+	b.outageActiveMessage = nil
+	b.outageMessagesMu.Unlock()
+
+	if start.IsZero() {
+		return
+	}
+
+	duration := formatDuration(time.Since(start))
+	desc := fmt.Sprintf("Connection restored after **%s**.\n%d queued Discord message(s) are now being delivered.", duration, queued)
+
+	if existing != nil {
+		if err := b.editOutageEmbed(existing.ID, "Sneedchat outage resolved", desc, OutageEmbedColorFixed); err != nil {
+			log.Printf("❌ Failed to update outage resolution message: %v", err)
+		}
+		return
+	}
+
+	msg, err := b.sendOutageEmbed("Sneedchat outage resolved", desc, OutageEmbedColorFixed)
+	if err != nil {
+		log.Printf("❌ Failed to send outage resolution message: %v", err)
+		return
+	}
+	b.outageMessagesMu.Lock()
+	toDelete := b.swapOutageNoticesLocked(msg)
+	b.outageMessagesMu.Unlock()
+	b.deleteOutageMessages(toDelete)
+}
+
+func (b *Bridge) deleteOutageMessages(messages []*discordgo.Message) {
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if err := b.deleteWebhookMessage(msg.ID); err != nil {
+			log.Printf("❌ Failed to prune outage notice %s: %v", msg.ID, err)
+		}
+	}
+}
+
+func (b *Bridge) swapOutageNoticesLocked(newMsg *discordgo.Message) []*discordgo.Message {
+	toDelete := make([]*discordgo.Message, len(b.outageNotices))
+	copy(toDelete, b.outageNotices)
+	b.outageNotices = []*discordgo.Message{newMsg}
+	return toDelete
+}
+
 func (b *Bridge) recentOutboundIter() []map[string]interface{} {
 	b.recentOutboundMu.Lock()
 	defer b.recentOutboundMu.Unlock()
@@ -413,40 +582,129 @@ func (b *Bridge) mapDiscordSneed(discordID, sneedID int, username string) {
 	log.Printf("Mapped sneed_id=%d <-> discord_id=%d (username='%s')", sneedID, discordID, username)
 }
 
-func (b *Bridge) uploadToLitterbox(fileURL, filename string) (string, error) {
-	resp, err := b.httpClient.Get(fileURL)
-	if err != nil {
-		return "", err
+func (b *Bridge) sendUploadStatusMessage(channelID, mention string, attachmentCount int) (*discordgo.Message, error) {
+	desc := fmt.Sprintf("Uploading %d attachment(s) from %s…", attachmentCount, mention)
+	msg := &discordgo.MessageSend{
+		Embeds: []*discordgo.MessageEmbed{buildStatusEmbed(b.uploadStatusTitle(""), desc, UploadStatusColorPending)},
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
+	return b.session.ChannelMessageSendComplex(channelID, msg)
+}
+
+func (b *Bridge) uploadStatusTitle(suffix string) string {
+	base := fmt.Sprintf("%s upload", b.mediaServiceDisplayName())
+	if suffix == "" {
+		return base
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
+	return fmt.Sprintf("%s %s", base, suffix)
+}
+
+func (b *Bridge) mediaServiceDisplayName() string {
+	if b.mediaSvc == nil {
+		return "Media"
 	}
-	body := &bytes.Buffer{}
-	w := multipart.NewWriter(body)
-	_ = w.WriteField("reqtype", "fileupload")
-	_ = w.WriteField("time", LitterboxTTL)
-	part, _ := w.CreateFormFile("fileToUpload", filename)
-	_, _ = part.Write(data)
-	_ = w.Close()
-	req, _ := http.NewRequest("POST", "https://litterbox.catbox.moe/resources/internals/api.php", body)
-	req.Header.Set("Content-Type", w.FormDataContentType())
-	uResp, err := b.httpClient.Do(req)
-	if err != nil {
-		return "", err
+	name := capitalizeWord(b.mediaSvc.Name())
+	if name == "" {
+		return "Media"
 	}
-	defer uResp.Body.Close()
-	if uResp.StatusCode != 200 {
-		return "", fmt.Errorf("Litterbox returned HTTP %d", uResp.StatusCode)
+	return name
+}
+
+func (b *Bridge) editUploadStatusMessage(channelID, messageID, title, description string, color int) {
+	embed := buildStatusEmbed(title, description, color)
+	edit := &discordgo.MessageEdit{
+		ID:      messageID,
+		Channel: channelID,
+		Embeds:  []*discordgo.MessageEmbed{embed},
 	}
-	out, _ := io.ReadAll(uResp.Body)
-	url := strings.TrimSpace(string(out))
-	log.Printf("SUCCESS: Uploaded '%s' to Litterbox: %s", filename, url)
-	return url, nil
+	if _, err := b.session.ChannelMessageEditComplex(edit); err != nil {
+		log.Printf("⚠️ Failed to edit upload status message %s: %v", messageID, err)
+	}
+}
+
+func (b *Bridge) awaitSneedConfirmation(discordID int, channelID, statusMessageID string) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	timer := time.NewTimer(UploadDeliveryTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if _, ok := b.discordToSneed.Get(discordID); ok {
+				desc := "Delivered to Sneedchat."
+				b.editUploadStatusMessage(channelID, statusMessageID, b.uploadStatusTitle("complete"), desc, UploadStatusColorSuccess)
+				b.scheduleUploadStatusDeletion(channelID, statusMessageID, UploadStatusCleanupDelay)
+				return
+			}
+		case <-timer.C:
+			desc := "Uploads finished but no Sneedchat confirmation was observed. Message may have been dropped."
+			b.editUploadStatusMessage(channelID, statusMessageID, b.uploadStatusTitle("warning"), desc, UploadStatusColorFailed)
+			b.scheduleUploadStatusDeletion(channelID, statusMessageID, UploadStatusFailureLifetime)
+			return
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
+func (b *Bridge) scheduleUploadStatusDeletion(channelID, messageID string, delay time.Duration) {
+	go func() {
+		select {
+		case <-time.After(delay):
+			if err := b.session.ChannelMessageDelete(channelID, messageID); err != nil {
+				log.Printf("⚠️ Failed to delete upload status message %s: %v", messageID, err)
+			}
+		case <-b.stopCh:
+		}
+	}()
+}
+
+func buildStatusEmbed(title, description string, color int) *discordgo.MessageEmbed {
+	return &discordgo.MessageEmbed{
+		Title:       title,
+		Description: description,
+		Color:       color,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func capitalizeWord(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
+}
+
+func (b *Bridge) sendOutageEmbed(title, description string, color int) (*discordgo.Message, error) {
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	embed := buildOutageEmbed(title, description, color)
+	params := &discordgo.WebhookParams{Embeds: []*discordgo.MessageEmbed{embed}}
+	return b.session.WebhookExecute(webhookID, webhookToken, true, params)
+}
+
+func (b *Bridge) editOutageEmbed(messageID, title, description string, color int) error {
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	embed := buildOutageEmbed(title, description, color)
+	embeds := []*discordgo.MessageEmbed{embed}
+	edit := &discordgo.WebhookEdit{Embeds: &embeds}
+	_, err := b.session.WebhookMessageEdit(webhookID, webhookToken, messageID, edit)
+	return err
+}
+
+func buildOutageEmbed(title, description string, color int) *discordgo.MessageEmbed {
+	return &discordgo.MessageEmbed{
+		Title:       title,
+		Description: description,
+		Color:       color,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func (b *Bridge) deleteWebhookMessage(messageID string) error {
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	return b.session.WebhookMessageDelete(webhookID, webhookToken, messageID)
 }
 
 func parseWebhookURL(webhookURL string) (string, string) {
@@ -460,4 +718,16 @@ func parseWebhookURL(webhookURL string) (string, string) {
 func parseMessageID(id string) int {
 	parsed, _ := strconv.ParseInt(id, 10, 64)
 	return int(parsed)
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh%dm", hours, minutes)
 }

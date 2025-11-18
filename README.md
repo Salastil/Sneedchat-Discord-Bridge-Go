@@ -7,6 +7,7 @@ A high-performance bridge written in Go that synchronizes messages between Kiwi 
 - ✅ Bidirectional message sync (Sneedchat ↔ Discord)
 - ✅ Edit and delete synchronization
 - ✅ Attachment uploads and BBcode formating via Litterbox
+- ✅ Pluggable media upload services (Litterbox by default)
 - ✅ BBCode → Markdown parsing
 - ✅ Message queueing during outages
 
@@ -135,6 +136,7 @@ Create separate systemd services with unique names
 **Important Notes:**
 - Replace `BRIDGE_USERNAME` with your **Kiwi Farms username** (not email)
 - `SNEEDCHAT_ROOM_ID=1` is the default Sneedchat room
+- `MEDIA_UPLOAD_SERVICE` selects the attachment backend (currently only `litterbox`)
 - Keep quotes out of values
 - Don't share your `.env` file!
 
@@ -161,6 +163,9 @@ BRIDGE_USER_ID=12345
 # Optional: Discord ping conversion
 # Your Discord user ID (right-click yourself → Copy User ID)
 DISCORD_PING_USER_ID=1234567890123456789
+
+# Media upload backend (defaults to litterbox if unset)
+MEDIA_UPLOAD_SERVICE=litterbox
 
 # Optional: Enable file logging
 ENABLE_FILE_LOGGING=false
