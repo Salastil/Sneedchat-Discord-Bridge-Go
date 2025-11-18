@@ -20,15 +20,17 @@ import (
 )
 
 const (
-	MaxAttachments          = 4
-	LitterboxTTL            = "72h"
-	ProcessedCacheSize      = 250
-	MappingCacheSize        = 1000
-	MappingMaxAge           = 1 * time.Hour
-	MappingCleanupInterval  = 5 * time.Minute
-	QueuedMessageTTL        = 90 * time.Second
-	OutageUpdateInterval    = 10 * time.Second
-	OutboundMatchWindow     = 60 * time.Second
+	MaxAttachments         = 4
+	LitterboxTTL           = "72h"
+	ProcessedCacheSize     = 250
+	MappingCacheSize       = 1000
+	MappingMaxAge          = 1 * time.Hour
+	MappingCleanupInterval = 5 * time.Minute
+	QueuedMessageTTL       = 90 * time.Second
+	OutageUpdateInterval   = 10 * time.Second
+	OutboundMatchWindow    = 60 * time.Second
+	OutageEmbedColorActive = 0xF1C40F
+	OutageEmbedColorFixed  = 0x2ECC71
 )
 
 type OutboundEntry struct {
@@ -46,9 +48,9 @@ type QueuedMessage struct {
 }
 
 type Bridge struct {
-	cfg       *config.Config
-	session   *discordgo.Session
-	sneed     *sneed.Client
+	cfg        *config.Config
+	session    *discordgo.Session
+	sneed      *sneed.Client
 	httpClient *http.Client
 
 	sneedToDiscord *utils.BoundedMap
@@ -61,9 +63,10 @@ type Bridge struct {
 	queuedOutbound   []QueuedMessage
 	queuedOutboundMu sync.Mutex
 
-	outageMessages   []*discordgo.Message
-	outageMessagesMu sync.Mutex
-	outageStart      time.Time
+	outageNotices       []*discordgo.Message
+	outageActiveMessage *discordgo.Message
+	outageMessagesMu    sync.Mutex
+	outageStart         time.Time
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -75,17 +78,17 @@ func NewBridge(cfg *config.Config, sneedClient *sneed.Client) (*Bridge, error) {
 		return nil, err
 	}
 	b := &Bridge{
-		cfg:             cfg,
-		session:         s,
-		sneed:           sneedClient,
-		httpClient:      &http.Client{Timeout: 60 * time.Second},
-		sneedToDiscord:  utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
-		discordToSneed:  utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
-		sneedUsernames:  utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
-		recentOutbound:  make([]OutboundEntry, 0, ProcessedCacheSize),
-		queuedOutbound:  make([]QueuedMessage, 0),
-		outageMessages:  make([]*discordgo.Message, 0),
-		stopCh:          make(chan struct{}),
+		cfg:            cfg,
+		session:        s,
+		sneed:          sneedClient,
+		httpClient:     &http.Client{Timeout: 60 * time.Second},
+		sneedToDiscord: utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
+		discordToSneed: utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
+		sneedUsernames: utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
+		recentOutbound: make([]OutboundEntry, 0, ProcessedCacheSize),
+		queuedOutbound: make([]QueuedMessage, 0),
+		outageNotices:  make([]*discordgo.Message, 0),
+		stopCh:         make(chan struct{}),
 	}
 
 	// hook Sneed client callbacks
@@ -348,12 +351,15 @@ func (b *Bridge) handleSneedDelete(sneedID int) {
 func (b *Bridge) onSneedConnect() {
 	log.Println("🟢 Sneedchat connected")
 	b.session.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "online"})
+	queued := b.queuedMessageCount()
+	b.finishOutageNotification(queued)
 	go b.flushQueuedMessages()
 }
 
 func (b *Bridge) onSneedDisconnect() {
 	log.Println("🔴 Sneedchat disconnected")
 	b.session.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "idle"})
+	b.startOutageNotificationLoop()
 }
 
 func (b *Bridge) flushQueuedMessages() {
@@ -391,6 +397,125 @@ func (b *Bridge) flushQueuedMessages() {
 	}
 }
 
+func (b *Bridge) queuedMessageCount() int {
+	b.queuedOutboundMu.Lock()
+	defer b.queuedOutboundMu.Unlock()
+	return len(b.queuedOutbound)
+}
+
+func (b *Bridge) startOutageNotificationLoop() {
+	b.outageMessagesMu.Lock()
+	alreadyRunning := !b.outageStart.IsZero()
+	if !alreadyRunning {
+		b.outageStart = time.Now()
+		go b.outageNotificationLoop()
+	}
+	b.outageMessagesMu.Unlock()
+}
+
+func (b *Bridge) outageNotificationLoop() {
+	if !b.updateOutageMessage() {
+		return
+	}
+	ticker := time.NewTicker(OutageUpdateInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if !b.updateOutageMessage() {
+				return
+			}
+		case <-b.stopCh:
+			return
+		}
+	}
+}
+
+func (b *Bridge) updateOutageMessage() bool {
+	b.outageMessagesMu.Lock()
+	start := b.outageStart
+	existing := b.outageActiveMessage
+	b.outageMessagesMu.Unlock()
+
+	if start.IsZero() {
+		return false
+	}
+
+	duration := formatDuration(time.Since(start))
+	queued := b.queuedMessageCount()
+	desc := fmt.Sprintf("Connection lost **%s** ago.\n%d queued Discord message(s) will be sent automatically once Sneedchat returns.", duration, queued)
+
+	if existing == nil {
+		msg, err := b.sendOutageEmbed("Sneedchat outage", desc, OutageEmbedColorActive)
+		if err != nil {
+			log.Printf("❌ Failed to send outage notification: %v", err)
+			return true
+		}
+		b.outageMessagesMu.Lock()
+		b.outageActiveMessage = msg
+		toDelete := b.swapOutageNoticesLocked(msg)
+		b.outageMessagesMu.Unlock()
+		b.deleteOutageMessages(toDelete)
+	} else {
+		if err := b.editOutageEmbed(existing.ID, "Sneedchat outage", desc, OutageEmbedColorActive); err != nil {
+			log.Printf("❌ Failed to update outage notification: %v", err)
+		}
+	}
+
+	return true
+}
+
+func (b *Bridge) finishOutageNotification(queued int) {
+	b.outageMessagesMu.Lock()
+	start := b.outageStart
+	b.outageStart = time.Time{}
+	existing := b.outageActiveMessage
+	b.outageActiveMessage = nil
+	b.outageMessagesMu.Unlock()
+
+	if start.IsZero() {
+		return
+	}
+
+	duration := formatDuration(time.Since(start))
+	desc := fmt.Sprintf("Connection restored after **%s**.\n%d queued Discord message(s) are now being delivered.", duration, queued)
+
+	if existing != nil {
+		if err := b.editOutageEmbed(existing.ID, "Sneedchat outage resolved", desc, OutageEmbedColorFixed); err != nil {
+			log.Printf("❌ Failed to update outage resolution message: %v", err)
+		}
+		return
+	}
+
+	msg, err := b.sendOutageEmbed("Sneedchat outage resolved", desc, OutageEmbedColorFixed)
+	if err != nil {
+		log.Printf("❌ Failed to send outage resolution message: %v", err)
+		return
+	}
+	b.outageMessagesMu.Lock()
+	toDelete := b.swapOutageNoticesLocked(msg)
+	b.outageMessagesMu.Unlock()
+	b.deleteOutageMessages(toDelete)
+}
+
+func (b *Bridge) deleteOutageMessages(messages []*discordgo.Message) {
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		if err := b.deleteWebhookMessage(msg.ID); err != nil {
+			log.Printf("❌ Failed to prune outage notice %s: %v", msg.ID, err)
+		}
+	}
+}
+
+func (b *Bridge) swapOutageNoticesLocked(newMsg *discordgo.Message) []*discordgo.Message {
+	toDelete := make([]*discordgo.Message, len(b.outageNotices))
+	copy(toDelete, b.outageNotices)
+	b.outageNotices = []*discordgo.Message{newMsg}
+	return toDelete
+}
+
 func (b *Bridge) recentOutboundIter() []map[string]interface{} {
 	b.recentOutboundMu.Lock()
 	defer b.recentOutboundMu.Unlock()
@@ -411,6 +536,36 @@ func (b *Bridge) mapDiscordSneed(discordID, sneedID int, username string) {
 	b.sneedToDiscord.Set(sneedID, discordID)
 	b.sneedUsernames.Set(sneedID, username)
 	log.Printf("Mapped sneed_id=%d <-> discord_id=%d (username='%s')", sneedID, discordID, username)
+}
+
+func (b *Bridge) sendOutageEmbed(title, description string, color int) (*discordgo.Message, error) {
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	embed := buildOutageEmbed(title, description, color)
+	params := &discordgo.WebhookParams{Embeds: []*discordgo.MessageEmbed{embed}}
+	return b.session.WebhookExecute(webhookID, webhookToken, true, params)
+}
+
+func (b *Bridge) editOutageEmbed(messageID, title, description string, color int) error {
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	embed := buildOutageEmbed(title, description, color)
+	embeds := []*discordgo.MessageEmbed{embed}
+	edit := &discordgo.WebhookEdit{Embeds: &embeds}
+	_, err := b.session.WebhookMessageEdit(webhookID, webhookToken, messageID, edit)
+	return err
+}
+
+func buildOutageEmbed(title, description string, color int) *discordgo.MessageEmbed {
+	return &discordgo.MessageEmbed{
+		Title:       title,
+		Description: description,
+		Color:       color,
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+	}
+}
+
+func (b *Bridge) deleteWebhookMessage(messageID string) error {
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	return b.session.WebhookMessageDelete(webhookID, webhookToken, messageID)
 }
 
 func (b *Bridge) uploadToLitterbox(fileURL, filename string) (string, error) {
@@ -460,4 +615,16 @@ func parseWebhookURL(webhookURL string) (string, string) {
 func parseMessageID(id string) int {
 	parsed, _ := strconv.ParseInt(id, 10, 64)
 	return int(parsed)
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+	return fmt.Sprintf("%dh%dm", hours, minutes)
 }
