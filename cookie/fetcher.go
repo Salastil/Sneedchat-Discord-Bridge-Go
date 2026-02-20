@@ -2,6 +2,7 @@ package cookie
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -48,7 +49,7 @@ func NewCookieRefreshServiceWithDebug(username, password, domain string, debug b
 	if err != nil {
 		return nil, err
 	}
-	tr := &http.Transport{} 
+	tr := &http.Transport{}
 	client := &http.Client{
 		Jar:       jar,
 		Transport: tr,
@@ -70,7 +71,7 @@ func (s *CookieRefreshService) Start() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		
+
 		// Initial fetch
 		log.Println("⏳ Fetching initial cookie...")
 		c, err := s.FetchFreshCookie()
@@ -84,11 +85,11 @@ func (s *CookieRefreshService) Start() {
 		s.mu.Unlock()
 		s.readyOnce.Do(func() { close(s.readyCh) })
 		log.Println("✅ Initial cookie obtained")
-		
+
 		// Continuous refresh loop
 		ticker := time.NewTicker(CookieRefreshInterval)
 		defer ticker.Stop()
-		
+
 		for {
 			select {
 			case <-ticker.C:
@@ -166,15 +167,15 @@ func (s *CookieRefreshService) attemptFetchCookie() (string, error) {
 		return http.ErrUseLastResponse
 	}
 
-	// --- Step 1: KiwiFlare
+	// --- Step 1: Tartarus PoW gate
 	if s.debug {
-		log.Println("Step 1: Checking for KiwiFlare challenge...")
+		log.Println("Step 1: Checking for Tartarus challenge...")
 	}
-	if err := s.solveKiwiFlareIfPresent(base); err != nil {
-		return "", fmt.Errorf("KiwiFlare solve failed: %w", err)
+	if err := s.solveTartarusIfPresent(base); err != nil {
+		return "", fmt.Errorf("Tartarus solve failed: %w", err)
 	}
 	if s.debug {
-		log.Println("✅ KiwiFlare challenge solved")
+		log.Println("✅ Tartarus solved")
 	}
 
 	time.Sleep(2 * time.Second)
@@ -290,9 +291,9 @@ func (s *CookieRefreshService) attemptFetchCookie() (string, error) {
 }
 
 // -------------------------------------------
-// KiwiFlare handling
+// Tartarus PoW gate handling
 // -------------------------------------------
-func (s *CookieRefreshService) solveKiwiFlareIfPresent(base string) error {
+func (s *CookieRefreshService) solveTartarusIfPresent(base string) error {
 	req, _ := http.NewRequest("GET", base, nil)
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	resp, err := s.client.Do(req)
@@ -304,32 +305,54 @@ func (s *CookieRefreshService) solveKiwiFlareIfPresent(base string) error {
 	body, _ := io.ReadAll(resp.Body)
 	html := string(body)
 
-	// Look for data-sssg-challenge and difficulty
-	re := regexp.MustCompile(`data-sssg-challenge=["']([0-9a-fA-F]+)["'][^>]*data-sssg-difficulty=["'](\d+)["']`)
-	m := re.FindStringSubmatch(html)
-	if len(m) < 3 {
+	challenge, found := parseTartarusChallenge(html)
+	if !found {
 		if s.debug {
-			log.Println("No KiwiFlare POW detected")
+			log.Println("No Tartarus PoW challenge detected")
 		}
 		return nil
 	}
-	token := m[1]
-	diff, _ := strconv.Atoi(m[2])
 
 	if s.debug {
-		log.Printf("Solving KiwiFlare challenge (difficulty=%d, token=%s...)", diff, abbreviate(token, 10))
+		log.Printf("Solving Tartarus challenge (difficulty=%d, token=%s...)", challenge.Difficulty, abbreviate(challenge.Salt, 10))
 	}
-	nonce, dur, err := s.solvePoW(token, diff)
+
+	nonce, dur, err := s.solvePoW(challenge.Salt, challenge.Difficulty, challenge.Patience)
 	if err != nil {
 		return err
 	}
+
 	if s.debug {
-		log.Printf("✅ KiwiFlare challenge solved in %v (nonce=%s)", dur, nonce)
+		log.Printf("✅ Tartarus challenge solved in %v (nonce=%s)", dur, nonce)
 	}
 
-	// Submit solution
-	answerURL := fmt.Sprintf("https://%s/.sssg/api/answer", s.domain)
-	form := url.Values{"a": {token}, "b": {nonce}}
+	return s.submitTartarusAnswer(challenge.Salt, nonce)
+}
+
+type TartarusChallenge struct {
+	Salt       string
+	Difficulty int
+	Patience   time.Duration
+}
+
+func parseTartarusChallenge(html string) (TartarusChallenge, bool) {
+	saltMatch := regexp.MustCompile(`data-ttrs-challenge=["']([0-9a-fA-F]+)["']`).FindStringSubmatch(html)
+	difficultyMatch := regexp.MustCompile(`data-ttrs-difficulty=["'](\d+)["']`).FindStringSubmatch(html)
+	if len(saltMatch) != 2 || len(difficultyMatch) != 2 {
+		return TartarusChallenge{}, false
+	}
+
+	difficulty, err := strconv.Atoi(difficultyMatch[1])
+	if err != nil {
+		return TartarusChallenge{}, false
+	}
+
+	return TartarusChallenge{Salt: saltMatch[1], Difficulty: difficulty, Patience: 5 * time.Minute}, true
+}
+
+func (s *CookieRefreshService) submitTartarusAnswer(token, nonce string) error {
+	answerURL := fmt.Sprintf("https://%s/.ttrs/challenge", s.domain)
+	form := url.Values{"salt": {token}, "nonce": {nonce}}
 	subReq, _ := http.NewRequest("POST", answerURL, strings.NewReader(form.Encode()))
 	subReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	subReq.Header.Set("User-Agent", "Mozilla/5.0")
@@ -339,17 +362,23 @@ func (s *CookieRefreshService) solveKiwiFlareIfPresent(base string) error {
 	}
 	defer subResp.Body.Close()
 
-	if subResp.StatusCode != 200 {
-		body, _ := io.ReadAll(subResp.Body)
-		return fmt.Errorf("challenge solve HTTP %d (%s)", subResp.StatusCode, strings.TrimSpace(string(body)))
+	body, _ := io.ReadAll(subResp.Body)
+	var payload struct {
+		Success bool   `json:"success"`
+		Reason  string `json:"reason"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return fmt.Errorf("tartarus response decode failed: %w", err)
+	}
+	if !payload.Success {
+		return fmt.Errorf("tartarus rejected solution: %s", payload.Reason)
 	}
 
-	// Check jar for sssg_clearance
 	rootURL, _ := url.Parse(fmt.Sprintf("https://%s/", s.domain))
 	for _, c := range s.jar.Cookies(rootURL) {
-		if c.Name == "sssg_clearance" {
+		if c.Name == "ttrs_clearance" {
 			if s.debug {
-				log.Printf("✅ KiwiFlare clearance cookie confirmed: %s...", abbreviate(c.Value, 10))
+				log.Printf("✅ Tartarus clearance cookie confirmed: %s...", abbreviate(c.Value, 10))
 			}
 			break
 		}
@@ -359,35 +388,22 @@ func (s *CookieRefreshService) solveKiwiFlareIfPresent(base string) error {
 	return nil
 }
 
-func (s *CookieRefreshService) solvePoW(token string, difficulty int) (string, time.Duration, error) {
+func (s *CookieRefreshService) solvePoW(token string, difficulty int, timeout time.Duration) (string, time.Duration, error) {
 	start := time.Now()
 	nonce := rand.Int63()
-	requiredBytes := difficulty / 8
-	requiredBits := difficulty % 8
 	const maxAttempts = 10_000_000
 
 	for attempts := 0; attempts < maxAttempts; attempts++ {
+		if timeout > 0 && time.Since(start) > timeout {
+			return "", 0, fmt.Errorf("failed to solve PoW within patience timeout (%s)", timeout)
+		}
 		nonce++
 		input := token + fmt.Sprintf("%d", nonce)
 		sum := sha256.Sum256([]byte(input))
 
-		// Check leading zero bits
-		ok := true
-		for i := 0; i < requiredBytes; i++ {
-			if sum[i] != 0 {
-				ok = false
-				break
-			}
-		}
-		if ok && requiredBits > 0 && requiredBytes < len(sum) {
-			mask := byte(0xFF << (8 - requiredBits))
-			if sum[requiredBytes]&mask != 0 {
-				ok = false
-			}
-		}
+		ok := testHashBitOrder(sum, difficulty)
 		if ok {
 			elapsed := time.Since(start)
-			// Stretch to >= ~1.7s to look human
 			if elapsed < 1700*time.Millisecond {
 				time.Sleep(1700*time.Millisecond - elapsed)
 				elapsed = 1700 * time.Millisecond
@@ -396,6 +412,20 @@ func (s *CookieRefreshService) solvePoW(token string, difficulty int) (string, t
 		}
 	}
 	return "", 0, fmt.Errorf("failed to solve PoW within %d attempts", maxAttempts)
+}
+
+func testHashBitOrder(hash [32]byte, difficulty int) bool {
+	for i := 0; i < difficulty; i++ {
+		byteIndex := i / 8
+		if byteIndex >= len(hash) {
+			return false
+		}
+		bitIndex := uint(i % 8)
+		if hash[byteIndex]&(1<<bitIndex) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func extractCSRF(body string) string {
@@ -423,7 +453,7 @@ func hasCookie(cookies []*http.Cookie, name string) bool {
 
 func buildCookieString(cookies []*http.Cookie) string {
 	want := map[string]bool{
-		"sssg_clearance": true,
+		"ttrs_clearance": true,
 		"xf_csrf":        true,
 		"xf_session":     true,
 		"xf_user":        true,
