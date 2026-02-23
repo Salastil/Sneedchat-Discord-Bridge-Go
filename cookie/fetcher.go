@@ -1,224 +1,213 @@
 package cookie
 
 import (
+	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
-	"net/http/cookiejar"
 	"net/url"
 	"regexp"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
-	"time"
 )
 
-const (
-	CookieRefreshInterval = 4 * time.Hour
-	CookieRetryDelay      = 5 * time.Second
-	MaxCookieRetryDelay   = 60 * time.Second
-)
-
-type CookieRefreshService struct {
-	username      string
-	password      string
-	domain        string
-	client        *http.Client
-	jar           http.CookieJar
-	currentCookie string
-
-	debug bool
-
-	mu        sync.RWMutex
-	readyOnce sync.Once
-	readyCh   chan struct{}
-	stopCh    chan struct{}
-	wg        sync.WaitGroup
+// SessionService manages XenForo session cookies as plain strings.
+// No http.Client jar is used anywhere — every cookie is stored explicitly
+// and overwritten on update, eliminating all accumulation bugs.
+type SessionService struct {
+	mu       sync.Mutex
+	cookies  map[string]string // name → value, last write wins
+	domain   *url.URL
+	username string
+	password string
+	tr       *http.Transport  // shared transport, TLS config applied once
 }
 
-func NewCookieRefreshService(username, password, domain string) (*CookieRefreshService, error) {
-	return NewCookieRefreshServiceWithDebug(username, password, domain, false)
+// NewSessionService creates a service, performs initial login, and returns.
+func NewSessionService(ctx context.Context, host, username, password string) (*SessionService, error) {
+	u, _ := url.Parse("https://" + host + "/")
+
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = tlsConfig()
+
+	s := &SessionService{
+		cookies:  make(map[string]string),
+		domain:   u,
+		username: username,
+		password: password,
+		tr:       tr,
+	}
+
+	log.Println("⏳ Logging in to Kiwi Farms...")
+	if err := s.Login(ctx); err != nil {
+		return nil, fmt.Errorf("initial login: %w", err)
+	}
+	log.Println("✅ Login successful")
+	return s, nil
 }
 
-func NewCookieRefreshServiceWithDebug(username, password, domain string, debug bool) (*CookieRefreshService, error) {
-	jar, err := cookiejar.New(nil)
+// tlsConfig mirrors sockchat's socketTLSConfig exactly:
+// concatenate secure + insecure cipher suites so KiwiFlare TLS fingerprinting
+// doesn't trigger. "The insecure ones appear to be necessary for consistently
+// getting around 203s." — sockchat source comment.
+func tlsConfig() *tls.Config {
+	all := slices.Concat(tls.CipherSuites(), tls.InsecureCipherSuites())
+	ids := make([]uint16, len(all))
+	for i, s := range all {
+		ids[i] = s.ID
+	}
+	return &tls.Config{CipherSuites: ids}
+}
+
+// Transport returns the shared *http.Transport for use in the WebSocket dialer.
+// The caller should use tr.DialContext and tr.TLSClientConfig directly,
+// mirroring sockchat's NewSocket pattern.
+func (s *SessionService) Transport() *http.Transport {
+	return s.tr
+}
+
+// setCookie stores a cookie by name, overwriting any previous value.
+func (s *SessionService) setCookie(name, value string) {
+	s.cookies[name] = value
+}
+
+// deleteCookie removes a cookie by name.
+func (s *SessionService) deleteCookie(name string) {
+	delete(s.cookies, name)
+}
+
+// absorbResponse reads all Set-Cookie headers from resp and stores them,
+// overwriting any existing values. Each call is idempotent per cookie name.
+func (s *SessionService) absorbResponse(resp *http.Response) {
+	for _, sc := range resp.Header["Set-Cookie"] {
+		seg := strings.SplitN(sc, ";", 2)
+		kv := strings.SplitN(strings.TrimSpace(seg[0]), "=", 2)
+		if len(kv) == 2 {
+			s.cookies[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+		}
+	}
+}
+
+// cookieHeader returns the current cookie state as a "name=value; ..." string
+// suitable for use as a Cookie HTTP header or WebSocket dial header.
+func (s *SessionService) cookieHeader() string {
+	parts := make([]string, 0, len(s.cookies))
+	for k, v := range s.cookies {
+		if v != "" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// do performs a single HTTP round-trip via the shared transport.
+// Injects current cookies, absorbs Set-Cookie from response.
+// Does not follow redirects.
+func (s *SessionService) do(req *http.Request) (*http.Response, error) {
+	if cookie := s.cookieHeader(); cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	resp, err := s.tr.RoundTrip(req)
 	if err != nil {
 		return nil, err
 	}
-	tr := &http.Transport{} 
-	client := &http.Client{
-		Jar:       jar,
-		Transport: tr,
-		Timeout:   30 * time.Second,
-	}
-	return &CookieRefreshService{
-		username: username,
-		password: password,
-		domain:   domain,
-		client:   client,
-		jar:      jar,
-		debug:    debug,
-		readyCh:  make(chan struct{}),
-		stopCh:   make(chan struct{}),
-	}, nil
+	s.absorbResponse(resp)
+	return resp, nil
 }
 
-func (s *CookieRefreshService) Start() {
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		
-		// Initial fetch
-		log.Println("⏳ Fetching initial cookie...")
-		c, err := s.FetchFreshCookie()
-		if err != nil {
-			log.Printf("❌ Failed to obtain initial cookie: %v", err)
-			s.readyOnce.Do(func() { close(s.readyCh) })
-			return
-		}
-		s.mu.Lock()
-		s.currentCookie = c
-		s.mu.Unlock()
-		s.readyOnce.Do(func() { close(s.readyCh) })
-		log.Println("✅ Initial cookie obtained")
-		
-		// Continuous refresh loop
-		ticker := time.NewTicker(CookieRefreshInterval)
-		defer ticker.Stop()
-		
-		for {
-			select {
-			case <-ticker.C:
-				log.Println("🔄 Auto-refreshing cookie...")
-				newCookie, err := s.FetchFreshCookie()
-				if err != nil {
-					log.Printf("⚠️ Cookie auto-refresh failed: %v", err)
-					continue
-				}
-				s.mu.Lock()
-				s.currentCookie = newCookie
-				s.mu.Unlock()
-				log.Println("✅ Cookie auto-refresh successful")
-			case <-s.stopCh:
-				log.Println("Cookie refresh service stopping")
-				return
-			}
-		}
-	}()
-}
-
-func (s *CookieRefreshService) WaitForCookie() {
-	<-s.readyCh
-}
-
-func (s *CookieRefreshService) Stop() {
-	close(s.stopCh)
-	s.wg.Wait()
-}
-
-func (s *CookieRefreshService) GetCurrentCookie() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.currentCookie
-}
-
-func (s *CookieRefreshService) FetchFreshCookie() (string, error) {
-	if s.debug {
-		log.Println("💡 Stage: Starting FetchFreshCookie")
-	}
-
-	attempt := 0
-	delay := CookieRetryDelay
-
-	for {
-		attempt++
-		c, err := s.attemptFetchCookie()
-		if err == nil {
-			if s.debug {
-				log.Printf("✅ Successfully fetched fresh cookie with xf_user (attempt %d)", attempt)
-			}
-			return c, nil
-		}
-
-		log.Printf("⚠️ Cookie fetch attempt %d failed: %v", attempt, err)
-		// Exponential backoff, capped
-		time.Sleep(delay)
-		delay *= 2
-		if delay > MaxCookieRetryDelay {
-			delay = MaxCookieRetryDelay
-		}
-	}
-}
-
-func (s *CookieRefreshService) attemptFetchCookie() (string, error) {
-	base := fmt.Sprintf("https://%s/", s.domain)
-	loginPage := fmt.Sprintf("https://%s/login", s.domain)
-	loginPost := fmt.Sprintf("https://%s/login/login", s.domain)
-	accountURL := fmt.Sprintf("https://%s/account/", s.domain)
-	rootURL, _ := url.Parse(base)
-
-	// Reset redirect policy for manual control
-	s.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-		// don't auto-follow on login POST so we can inspect cookies first
-		return http.ErrUseLastResponse
-	}
-
-	// --- Step 1: KiwiFlare
-	if s.debug {
-		log.Println("Step 1: Checking for KiwiFlare challenge...")
-	}
-	if err := s.solveKiwiFlareIfPresent(base); err != nil {
-		return "", fmt.Errorf("KiwiFlare solve failed: %w", err)
-	}
-	if s.debug {
-		log.Println("✅ KiwiFlare challenge solved")
-	}
-
-	time.Sleep(2 * time.Second)
-
-	// --- Step 2: GET /login ---
-	if s.debug {
-		log.Println("Step 2: Fetching login page...")
-	}
-	reqLogin, _ := http.NewRequest("GET", loginPage, nil)
-	reqLogin.Header.Set("Cache-Control", "no-cache")
-	reqLogin.Header.Set("Pragma", "no-cache")
-	reqLogin.Header.Set("User-Agent", "Mozilla/5.0")
-	respLogin, err := s.client.Do(reqLogin)
+// get performs a GET request, solving any KiwiFlare 203 challenge inline.
+// host can differ from s.domain.Host for non-standard port endpoints.
+func (s *SessionService) get(ctx context.Context, target *url.URL) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", target.String(), nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to get login page: %w", err)
+		return nil, err
 	}
-	defer respLogin.Body.Close()
+	resp, err := s.do(req)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode == 203 {
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		log.Printf("🔑 KiwiFlare 203 on %s — solving PoW...", target.Host)
+		if err := s.solveAndSubmit(ctx, body, target.Host); err != nil {
+			return nil, fmt.Errorf("PoW solve for %s: %w", target.Host, err)
+		}
+		return s.get(ctx, target) // retry after solve
+	}
+	return resp, nil
+}
 
-	bodyLogin, _ := io.ReadAll(respLogin.Body)
-	if s.debug {
-		log.Printf("📄 Login page HTML (first 1024 bytes):\n%s", firstN(string(bodyLogin), 1024))
+// solveAndSubmit parses a cerberus PoW challenge from the 203 response body,
+// solves it, and POSTs the solution to the issuing host (preserving port).
+// The resulting ttrs_clearance is absorbed via absorbResponse.
+func (s *SessionService) solveAndSubmit(ctx context.Context, body []byte, host string) error {
+	salt, diff, err := parseChallengeHTML(string(body))
+	if err != nil {
+		return fmt.Errorf("parse challenge: %w", err)
 	}
+	log.Printf("🔑 Challenge: salt=%s difficulty=%d", salt, diff)
 
-	// --- Step 3: Extract CSRF---
-	if s.debug {
-		log.Println("Step 3: Extracting CSRF token...")
+	nonce, err := solvePoW(ctx, salt, diff)
+	if err != nil {
+		return err
 	}
-	csrf := extractCSRF(string(bodyLogin))
+	log.Printf("✅ Solved: nonce=%d", nonce)
+
+	submitURL := fmt.Sprintf("https://%s/.ttrs/challenge", host)
+	body2 := fmt.Sprintf("salt=%s&redirect=/&nonce=%d", url.QueryEscape(salt), nonce)
+	req, err := http.NewRequestWithContext(ctx, "POST", submitURL, strings.NewReader(body2))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := s.do(req)
+	if err != nil {
+		return fmt.Errorf("submit: %w", err)
+	}
+	resp.Body.Close()
+	log.Printf("✅ Challenge submitted to %s (HTTP %d)", host, resp.StatusCode)
+	return nil
+}
+
+// Login performs a full XenForo login: solves KiwiFlare, gets CSRF, POSTs creds.
+// Caller must hold mu or be in a single-threaded context (NewSessionService).
+func (s *SessionService) Login(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.login(ctx)
+}
+
+func (s *SessionService) login(ctx context.Context) error {
+	base := s.domain.String()
+
+	log.Println("🔑 Priming KiwiFlare clearance...")
+	resp, err := s.get(ctx, s.domain)
+	if err != nil {
+		return fmt.Errorf("root GET: %w", err)
+	}
+	resp.Body.Close()
+	log.Println("✅ Clearance primed")
+
+	loginURL, _ := url.Parse(base + "login")
+	resp, err = s.get(ctx, loginURL)
+	if err != nil {
+		return fmt.Errorf("login page GET: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	csrf := extractCSRF(string(body))
 	if csrf == "" {
-		return "", fmt.Errorf("CSRF token not found in login page")
+		return fmt.Errorf("CSRF token not found")
 	}
-	if s.debug {
-		log.Printf("✅ Found CSRF token: %s...", abbreviate(csrf, 10))
-	}
-
-	// Record if already have xf_user BEFORE login POST
-	preCookies := s.jar.Cookies(rootURL)
-	hadXfUserBefore := hasCookie(preCookies, "xf_user")
-
-	// --- Step 4: POST /login/login---
-	if s.debug {
-		log.Println("Step 4: Submitting login credentials...")
-		logCookies("Cookies before login POST", preCookies)
-	}
+	log.Printf("🔐 CSRF token obtained: %s...", csrf[:min(10, len(csrf))])
 
 	form := url.Values{
 		"_xfToken":    {csrf},
@@ -227,184 +216,156 @@ func (s *CookieRefreshService) attemptFetchCookie() (string, error) {
 		"_xfRedirect": {base},
 		"remember":    {"1"},
 	}
-	postReq, _ := http.NewRequest("POST", loginPost, strings.NewReader(form.Encode()))
-	postReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	postReq.Header.Set("User-Agent", "Mozilla/5.0")
-	postReq.Header.Set("Referer", loginPage)
-	postReq.Header.Set("Origin", fmt.Sprintf("https://%s", s.domain))
-	postResp, err := s.client.Do(postReq)
-	if err != nil {
-		return "", fmt.Errorf("login POST failed: %w", err)
-	}
-	defer postResp.Body.Close()
-
-	if s.debug {
-		log.Printf("Login response status: %d", postResp.StatusCode)
-	}
-
-	// XenForo often 303 when successful; 200 might still be fine (AJAX template), so we don't fail on 200 alone.
-
-	// small delay to let cookies propagate
-	if s.debug {
-		log.Println("⏳ Waiting 2 seconds for XenForo to issue cookies...")
-	}
-	time.Sleep(2 * time.Second)
-
-	postCookies := s.jar.Cookies(rootURL)
-	if s.debug {
-		for _, c := range postCookies {
-			log.Printf("Cookie after login: %s=%s...", c.Name, abbreviate(c.Value, 10))
-		}
-	}
-
-	// Check for xf_user after login
-	if hasCookie(postCookies, "xf_user") {
-		return buildCookieString(postCookies), nil
-	}
-
-	// ---- Success path: If we had xf_user before and still no new xf_user now,
-	// try validating the existing session on /account/ and succeed if logged in.
-	if hadXfUserBefore {
-		if s.debug {
-			log.Println("🔍 Missing xf_user after login POST but it existed before; validating current session via /account/ ...")
-		}
-		ok, cookieStr := s.validateSessionUsingAccount(accountURL, rootURL)
-		if ok {
-			if s.debug {
-				log.Println("✅ /account/ shows logged-in; retaining existing session cookie")
-			}
-			return cookieStr, nil
-		}
-		if s.debug {
-			log.Println("⚠️ /account/ did not confirm logged-in; proceeding with failure")
-		}
-	}
-
-	// If not successful yet, read body for context & fail
-	bodyBytes, _ := io.ReadAll(postResp.Body)
-	bodyText := string(bodyBytes)
-	if s.debug {
-		log.Printf("📄 Login HTML snippet (first 500 chars):\n%s", firstN(bodyText, 500))
-	}
-	return "", fmt.Errorf("retry still missing xf_user cookie")
-}
-
-// -------------------------------------------
-// KiwiFlare handling
-// -------------------------------------------
-func (s *CookieRefreshService) solveKiwiFlareIfPresent(base string) error {
-	req, _ := http.NewRequest("GET", base, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := s.client.Do(req)
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"login/login",
+		strings.NewReader(form.Encode()))
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Referer", base+"login")
+	req.Header.Set("Origin", strings.TrimSuffix(base, "/"))
 
-	body, _ := io.ReadAll(resp.Body)
-	html := string(body)
-
-	// Look for data-sssg-challenge and difficulty
-	re := regexp.MustCompile(`data-sssg-challenge=["']([0-9a-fA-F]+)["'][^>]*data-sssg-difficulty=["'](\d+)["']`)
-	m := re.FindStringSubmatch(html)
-	if len(m) < 3 {
-		if s.debug {
-			log.Println("No KiwiFlare POW detected")
-		}
-		return nil
-	}
-	token := m[1]
-	diff, _ := strconv.Atoi(m[2])
-
-	if s.debug {
-		log.Printf("Solving KiwiFlare challenge (difficulty=%d, token=%s...)", diff, abbreviate(token, 10))
-	}
-	nonce, dur, err := s.solvePoW(token, diff)
+	postResp, err := s.do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("login POST: %w", err)
 	}
-	if s.debug {
-		log.Printf("✅ KiwiFlare challenge solved in %v (nonce=%s)", dur, nonce)
-	}
+	postResp.Body.Close()
 
-	// Submit solution
-	answerURL := fmt.Sprintf("https://%s/.sssg/api/answer", s.domain)
-	form := url.Values{"a": {token}, "b": {nonce}}
-	subReq, _ := http.NewRequest("POST", answerURL, strings.NewReader(form.Encode()))
-	subReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	subReq.Header.Set("User-Agent", "Mozilla/5.0")
-	subResp, err := s.client.Do(subReq)
-	if err != nil {
-		return err
+	if s.cookies["xf_user"] == "" {
+		return fmt.Errorf("xf_user not set after login — check credentials")
 	}
-	defer subResp.Body.Close()
-
-	if subResp.StatusCode != 200 {
-		body, _ := io.ReadAll(subResp.Body)
-		return fmt.Errorf("challenge solve HTTP %d (%s)", subResp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	// Check jar for sssg_clearance
-	rootURL, _ := url.Parse(fmt.Sprintf("https://%s/", s.domain))
-	for _, c := range s.jar.Cookies(rootURL) {
-		if c.Name == "sssg_clearance" {
-			if s.debug {
-				log.Printf("✅ KiwiFlare clearance cookie confirmed: %s...", abbreviate(c.Value, 10))
-			}
-			break
-		}
-	}
-
-	time.Sleep(2 * time.Second)
+	log.Println("✅ xf_user cookie obtained")
 	return nil
 }
 
-func (s *CookieRefreshService) solvePoW(token string, difficulty int) (string, time.Duration, error) {
-	start := time.Now()
-	nonce := rand.Int63()
-	requiredBytes := difficulty / 8
-	requiredBits := difficulty % 8
-	const maxAttempts = 10_000_000
+// Refresh gets a fresh xf_session. Falls back to full re-login if xf_user lost.
+// Mirrors sockchat's kf.RefreshSession() call in connect().
+func (s *SessionService) Refresh(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	for attempts := 0; attempts < maxAttempts; attempts++ {
-		nonce++
-		input := token + fmt.Sprintf("%d", nonce)
-		sum := sha256.Sum256([]byte(input))
+	log.Println("🔄 Refreshing session...")
+	s.setCookie("xf_session", "")
 
-		// Check leading zero bits
-		ok := true
-		for i := 0; i < requiredBytes; i++ {
-			if sum[i] != 0 {
-				ok = false
-				break
-			}
-		}
-		if ok && requiredBits > 0 && requiredBytes < len(sum) {
-			mask := byte(0xFF << (8 - requiredBits))
-			if sum[requiredBytes]&mask != 0 {
-				ok = false
-			}
-		}
-		if ok {
-			elapsed := time.Since(start)
-			// Stretch to >= ~1.7s to look human
-			if elapsed < 1700*time.Millisecond {
-				time.Sleep(1700*time.Millisecond - elapsed)
-				elapsed = 1700 * time.Millisecond
-			}
-			return fmt.Sprintf("%d", nonce), elapsed, nil
-		}
+	resp, err := s.get(ctx, s.domain)
+	if err != nil {
+		return err
 	}
-	return "", 0, fmt.Errorf("failed to solve PoW within %d attempts", maxAttempts)
+	resp.Body.Close()
+
+	if s.cookies["xf_user"] == "" {
+		log.Println("⚠️ xf_user lost — re-logging in...")
+		return s.login(ctx)
+	}
+
+	log.Println("✅ Session refreshed")
+	return nil
 }
 
+// CookieString returns current cookies as a Cookie header value.
+// ttrs_clearance is intentionally excluded — it must be solved fresh
+// per-endpoint before each WebSocket connection attempt.
+func (s *SessionService) CookieString() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cookieHeader()
+}
+
+// CookieStringForWS returns cookies for the WebSocket dial with ttrs_clearance
+// excluded. The caller must solve the clearance challenge for the WS endpoint
+// first and inject it directly into the dial headers.
+func (s *SessionService) CookieStringForWS() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	parts := make([]string, 0, len(s.cookies))
+	for k, v := range s.cookies {
+		if v != "" && k != "ttrs_clearance" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// SolveForHost solves a KiwiFlare 203 challenge from a non-standard port
+// endpoint (e.g. the WebSocket on 9443). The challenge body is parsed locally
+// but the solution is always submitted to port 443 — mirroring sockchat's
+// behaviour via cerberus, whose postSolution uses Hostname() (strips port).
+// The clearance issued by 443 is accepted by 9443.
+func (s *SessionService) SolveForHost(ctx context.Context, body []byte) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	before := s.cookies["ttrs_clearance"]
+	// Always submit to the base domain on port 443.
+	if err := s.solveAndSubmit(ctx, body, s.domain.Hostname()); err != nil {
+		return "", err
+	}
+	after := s.cookies["ttrs_clearance"]
+	if after == before {
+		return "", fmt.Errorf("ttrs_clearance unchanged after solve — submit may have failed")
+	}
+	return after, nil
+}
+
+// --- PoW solver ---
+
+func parseChallengeHTML(body string) (salt string, diff uint32, err error) {
+	sm := regexp.MustCompile(`data-ttrs-challenge=["']([^"']+)["']`).FindStringSubmatch(body)
+	dm := regexp.MustCompile(`data-ttrs-difficulty=["'](\d+)["']`).FindStringSubmatch(body)
+	if len(sm) < 2 || len(dm) < 2 {
+		return "", 0, fmt.Errorf("challenge attributes not found in HTML")
+	}
+	var d int
+	fmt.Sscanf(dm[1], "%d", &d)
+	return sm[1], uint32(d), nil
+}
+
+func solvePoW(ctx context.Context, salt string, difficulty uint32) (uint64, error) {
+	nbytes := difficulty / 8
+	rem := difficulty % 8
+	var mask byte
+	for i := uint32(0); i < rem; i++ {
+		mask = (mask << 1) | 1
+	}
+	if rem > 0 {
+		mask <<= 8 - rem
+	}
+
+	var nonce uint64
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		default:
+		}
+		nonce++
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s%d", salt, nonce)))
+		if leadingZeros(h[:], nbytes, rem, mask) {
+			return nonce, nil
+		}
+	}
+}
+
+func leadingZeros(hash []byte, nbytes, rem uint32, mask byte) bool {
+	for i := uint32(0); i < nbytes; i++ {
+		if hash[i] != 0 {
+			return false
+		}
+	}
+	if rem == 0 {
+		return true
+	}
+	return hash[nbytes]&mask == 0
+}
+
+// --- helpers ---
+
 func extractCSRF(body string) string {
-	patterns := []*regexp.Regexp{
+	for _, re := range []*regexp.Regexp{
 		regexp.MustCompile(`data-csrf=["']([^"']+)["']`),
 		regexp.MustCompile(`"csrf":"([^"]+)"`),
 		regexp.MustCompile(`XF\.config\.csrf\s*=\s*"([^"]+)"`),
-	}
-	for _, re := range patterns {
+	} {
 		if m := re.FindStringSubmatch(body); len(m) >= 2 {
 			return m[1]
 		}
@@ -412,83 +373,9 @@ func extractCSRF(body string) string {
 	return ""
 }
 
-func hasCookie(cookies []*http.Cookie, name string) bool {
-	for _, c := range cookies {
-		if c.Name == name {
-			return true
-		}
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	return false
-}
-
-func buildCookieString(cookies []*http.Cookie) string {
-	want := map[string]bool{
-		"sssg_clearance": true,
-		"xf_csrf":        true,
-		"xf_session":     true,
-		"xf_user":        true,
-		"xf_toggle":      true,
-	}
-	var parts []string
-	for _, c := range cookies {
-		if want[c.Name] {
-			parts = append(parts, fmt.Sprintf("%s=%s", c.Name, c.Value))
-		}
-	}
-	return strings.Join(parts, "; ")
-}
-
-func (s *CookieRefreshService) validateSessionUsingAccount(accountURL string, rootURL *url.URL) (bool, string) {
-	if s.debug {
-		log.Println("🔍 Validating session via /account/ ...")
-	}
-	req, _ := http.NewRequest("GET", accountURL, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		if s.debug {
-			log.Printf("⚠️ /account/ request error: %v", err)
-		}
-		return false, ""
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	snippet := firstN(string(body), 500)
-
-	if s.debug {
-		log.Printf("🔍 Accessed /account/ (%d)", resp.StatusCode)
-		log.Printf("📄 /account/ HTML snippet:\n%s", snippet)
-		for _, c := range s.jar.Cookies(rootURL) {
-			log.Printf("🍪 Cookie after /account/: %s=%s...", c.Name, abbreviate(c.Value, 10))
-		}
-	}
-
-	// Consider logged-in if data-logged-in="true" or the template isn't "login"
-	if strings.Contains(snippet, `data-logged-in="true"`) ||
-		(!strings.Contains(snippet, `data-template="login"`) && resp.StatusCode == 200) {
-		return true, buildCookieString(s.jar.Cookies(rootURL))
-	}
-	return false, ""
-}
-
-func logCookies(prefix string, cookies []*http.Cookie) {
-	log.Printf("%s (%d):", prefix, len(cookies))
-	for _, c := range cookies {
-		log.Printf("  - %s = %s...", c.Name, abbreviate(c.Value, 10))
-	}
-}
-
-func firstN(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
-}
-
-func abbreviate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
+	return b
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -28,21 +29,21 @@ func main() {
 	log.Printf("Using Sneedchat room ID: %d", cfg.SneedchatRoomID)
 	log.Printf("Bridge username: %s", cfg.BridgeUsername)
 
-	// Cookie service (now handles its own refresh loop)
-	cookieSvc, err := cookie.NewCookieRefreshService(cfg.BridgeUsername, cfg.BridgePassword, "kiwifarms.st")
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// SessionService owns the TLS config, cookie store, and shared transport.
+	// Login is performed here; cookies are stored as plain strings, no jar.
+	session, err := cookie.NewSessionService(ctx, "kiwifarms.st", cfg.BridgeUsername, cfg.BridgePassword)
 	if err != nil {
-		log.Fatalf("Failed to create cookie service: %v", err)
-	}
-	cookieSvc.Start()
-	cookieSvc.WaitForCookie()
-	if cookieSvc.GetCurrentCookie() == "" {
-		log.Fatal("❌ Failed to obtain initial cookie, cannot start bridge")
+		log.Fatalf("❌ Failed to establish session: %v", err)
 	}
 
-	// Sneedchat client
-	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, cookieSvc)
+	// NewClient uses session.Transport() for the WebSocket dialer,
+	// mirroring sockchat's NewSocket pattern exactly.
+	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, session, cfg.Debug)
+	sneedClient.SetBridgeIdentity(cfg.BridgeUserID, cfg.BridgeUsername)
 
-	// Discord bridge
 	bridge, err := discord.NewBridge(cfg, sneedClient)
 	if err != nil {
 		log.Fatalf("Failed to create Discord bridge: %v", err)
@@ -52,21 +53,15 @@ func main() {
 	}
 	log.Println("🌉 Discord-Sneedchat Bridge started successfully")
 
-	// Connect to Sneedchat
 	go func() {
-		if err := sneedClient.Connect(); err != nil {
+		if err := sneedClient.Connect(ctx); err != nil {
 			log.Printf("Initial Sneedchat connect failed: %v", err)
 		}
 	}()
 
-	// Graceful shutdown
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
-
+	<-ctx.Done()
 	log.Println("Shutdown signal received, cleaning up...")
 	bridge.Stop()
 	sneedClient.Disconnect()
-	cookieSvc.Stop()
 	log.Println("Bridge stopped successfully")
 }

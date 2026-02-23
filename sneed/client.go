@@ -1,12 +1,15 @@
 package sneed
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"html"
 	"log"
 	"net/http"
 	"regexp"
+	"slices"
 	"sync"
 	"time"
 
@@ -16,7 +19,7 @@ import (
 )
 
 const (
-	ProcessedCacheSize     = 1000  // Increased from 250
+	ProcessedCacheSize     = 1000
 	ReconnectInterval      = 7 * time.Second
 	MappingCacheSize       = 1000
 	MappingCleanupInterval = 5 * time.Minute
@@ -24,11 +27,24 @@ const (
 	OutboundMatchWindow    = 60 * time.Second
 )
 
+// socketTLSConfig mirrors the config used by sockchat: broad cipher suite list
+// to avoid KiwiFlare TLS fingerprint detection on the WebSocket upgrade.
+func socketTLSConfig() *tls.Config {
+	suites := slices.Concat(tls.CipherSuites(), tls.InsecureCipherSuites())
+	ids := make([]uint16, len(suites))
+	for i, s := range suites {
+		ids[i] = s.ID
+	}
+	return &tls.Config{CipherSuites: ids}
+}
+
+
 type Client struct {
 	wsURL   string
 	roomID  int
-	cookies *cookie.CookieRefreshService
+	session *cookie.SessionService
 
+	dialer    websocket.Dialer
 	conn      *websocket.Conn
 	connected bool
 	mu        sync.RWMutex
@@ -50,16 +66,25 @@ type Client struct {
 	recentOutboundIter func() []map[string]interface{}
 	mapDiscordSneed    func(int, int, string)
 
-	bridgeUserID      int
-	bridgeUsername    string
-	baseLoopsStarted  bool
+	bridgeUserID     int
+	bridgeUsername   string
+	baseLoopsStarted bool
+	debug            bool
 }
 
-func NewClient(roomID int, cookieSvc *cookie.CookieRefreshService) *Client {
+func NewClient(roomID int, session *cookie.SessionService, debug bool) *Client {
+	tr := session.Transport()
+
 	return &Client{
-		wsURL:               "wss://kiwifarms.st:9443/chat.ws",
-		roomID:              roomID,
-		cookies:             cookieSvc,
+		wsURL:   "wss://kiwifarms.st:9443/chat.ws",
+		roomID:  roomID,
+		session: session,
+		debug:   debug,
+		dialer: websocket.Dialer{
+			EnableCompression: true,
+			NetDialContext:    tr.DialContext,
+			TLSClientConfig:   tr.TLSClientConfig,
+		},
 		stopCh:              make(chan struct{}),
 		processedMessageIDs: make([]int, 0, ProcessedCacheSize),
 		messageEditDates:    utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
@@ -72,7 +97,7 @@ func (c *Client) SetBridgeIdentity(userID int, username string) {
 	c.bridgeUsername = username
 }
 
-func (c *Client) Connect() error {
+func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Lock()
 	if c.connected {
 		c.mu.Unlock()
@@ -80,15 +105,43 @@ func (c *Client) Connect() error {
 	}
 	c.mu.Unlock()
 
-	headers := http.Header{}
-	if ck := c.cookies.GetCurrentCookie(); ck != "" {
-		headers.Add("Cookie", ck)
+	// Exclude ttrs_clearance — must be solved fresh for port 9443.
+	headers := http.Header{
+		"Cookie": {c.session.CookieStringForWS()},
 	}
 
 	log.Printf("Connecting to Sneedchat room %d", c.roomID)
-	conn, _, err := websocket.DefaultDialer.Dial(c.wsURL, headers)
+	if c.debug {
+		log.Printf("🍪 Dial cookies: %s", headers.Get("Cookie"))
+	}
+
+	conn, resp, err := c.dialer.DialContext(ctx, c.wsURL, headers)
 	if err != nil {
-		return fmt.Errorf("websocket connection failed: %w", err)
+		if resp != nil && resp.StatusCode == 203 {
+			log.Println("⚠️ Got 203 on WebSocket dial — solving challenge...")
+			body := make([]byte, 0)
+			if resp.Body != nil {
+				buf := make([]byte, 8192)
+				n, _ := resp.Body.Read(buf)
+				body = buf[:n]
+				resp.Body.Close()
+			}
+			clearance, serr := c.session.SolveForHost(ctx, body)
+			if serr != nil {
+				return fmt.Errorf("PoW solve for WS endpoint: %w", serr)
+			}
+			wsBase := c.session.CookieStringForWS()
+			headers["Cookie"] = []string{wsBase + "; ttrs_clearance=" + clearance}
+			if c.debug {
+				log.Printf("🍪 Retry dial cookies: %s", headers.Get("Cookie"))
+			}
+			conn, _, err = c.dialer.DialContext(ctx, c.wsURL, headers)
+			if err != nil {
+				return fmt.Errorf("websocket connection failed after PoW solve: %w", err)
+			}
+		} else {
+			return fmt.Errorf("websocket connection failed: %w", err)
+		}
 	}
 
 	c.mu.Lock()
@@ -105,7 +158,7 @@ func (c *Client) Connect() error {
 	}
 
 	c.wg.Add(1)
-	go c.readLoop()
+	go c.readLoop(ctx)
 
 	c.Send(fmt.Sprintf("/join %d", c.roomID))
 	log.Printf("✅ Successfully connected to Sneedchat room %d", c.roomID)
@@ -119,7 +172,7 @@ func (c *Client) joinRoom() {
 	c.Send(fmt.Sprintf("/join %d", c.roomID))
 }
 
-func (c *Client) readLoop() {
+func (c *Client) readLoop(ctx context.Context) {
 	defer c.wg.Done()
 	for {
 		select {
@@ -138,12 +191,45 @@ func (c *Client) readLoop() {
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("Sneedchat read error: %v", err)
-			c.handleDisconnect()
+			c.handleDisconnect(ctx)
 			return
 		}
+
+		raw := string(message)
+
+		// Server sends plaintext "cannot join" when session has expired.
+		if isCannotJoin(raw) {
+			log.Println("⚠️ 'cannot join' received — refreshing session and reconnecting...")
+			if rerr := c.session.Refresh(ctx); rerr != nil {
+				log.Printf("❌ Session refresh failed: %v", rerr)
+			}
+			c.handleDisconnect(ctx)
+			return
+		}
+
+		c.mu.Lock()
 		c.lastMessage = time.Now()
-		c.handleIncoming(string(message))
+		c.mu.Unlock()
+
+		if c.debug {
+			preview := raw
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			log.Printf("📨 WS recv: %s", preview)
+		}
+
+		c.handleIncoming(raw)
 	}
+}
+
+func isCannotJoin(msg string) bool {
+	return len(msg) > 0 && !isJSON(msg) && len(msg) >= 11 && msg == "cannot join"
+}
+
+func isJSON(s string) bool {
+	var js json.RawMessage
+	return json.Unmarshal([]byte(s), &js) == nil
 }
 
 func (c *Client) heartbeatLoop() {
@@ -195,10 +281,17 @@ func (c *Client) Send(s string) bool {
 		log.Printf("Sneedchat write error: %v", err)
 		return false
 	}
+	if c.debug {
+		preview := s
+		if len(preview) > 120 {
+			preview = preview[:120] + "..."
+		}
+		log.Printf("📤 WS sent: %s", preview)
+	}
 	return true
 }
 
-func (c *Client) handleDisconnect() {
+func (c *Client) handleDisconnect(ctx context.Context) {
 	select {
 	case <-c.stopCh:
 		return
@@ -218,7 +311,6 @@ func (c *Client) handleDisconnect() {
 		c.OnDisconnect()
 	}
 
-	// Reconnection loop with exponential backoff
 	delay := ReconnectInterval
 	maxDelay := 2 * time.Minute
 	attempt := 0
@@ -226,16 +318,14 @@ func (c *Client) handleDisconnect() {
 	for {
 		select {
 		case <-c.stopCh:
-			log.Println("Reconnection cancelled - bridge stopping")
+			log.Println("Reconnection cancelled — bridge stopping")
 			return
 		case <-time.After(delay):
 			attempt++
 			log.Printf("🔄 Reconnection attempt #%d...", attempt)
-			
-			if err := c.Connect(); err != nil {
+
+			if err := c.Connect(ctx); err != nil {
 				log.Printf("⚠️ Reconnect attempt #%d failed: %v", attempt, err)
-				
-				// Exponential backoff
 				delay *= 2
 				if delay > maxDelay {
 					delay = maxDelay
@@ -244,11 +334,7 @@ func (c *Client) handleDisconnect() {
 			}
 
 			log.Println("🟢 Reconnected successfully")
-
-			// Allow websocket to stabilize
 			time.Sleep(2 * time.Second)
-
-			// Re-join room
 			c.joinRoom()
 			c.Send("/ping")
 			log.Printf("📍 Rejoined Sneedchat room %d after reconnect", c.roomID)
@@ -271,7 +357,14 @@ func (c *Client) Disconnect() {
 func (c *Client) handleIncoming(raw string) {
 	var payload SneedPayload
 	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		if c.debug {
+			log.Printf("⚠️ WS parse error: %v | raw: %.100s", err, raw)
+		}
 		return
+	}
+
+	if c.debug {
+		log.Printf("📦 payload: msgs=%d msg=%v del=%v", len(payload.Messages), payload.Message != nil, payload.Delete != nil)
 	}
 
 	if payload.Delete != nil {
@@ -398,18 +491,10 @@ func (c *Client) isProcessed(id int) bool {
 func (c *Client) addToProcessed(id int) {
 	c.processedMu.Lock()
 	defer c.processedMu.Unlock()
-	
 	c.processedMessageIDs = append(c.processedMessageIDs, id)
-	
-	// Hard cap: keep only the most recent 1000 messages (FIFO)
 	if len(c.processedMessageIDs) > ProcessedCacheSize {
 		excess := len(c.processedMessageIDs) - ProcessedCacheSize
 		c.processedMessageIDs = c.processedMessageIDs[excess:]
-		
-		// Log when significant eviction happens
-		if excess > 50 {
-			log.Printf("⚠️ Processed message cache full, evicted %d old entries", excess)
-		}
 	}
 }
 
@@ -432,6 +517,12 @@ func (c *Client) SetMapDiscordSneed(f func(int, int, string)) {
 	c.mapDiscordSneed = f
 }
 
+func (c *Client) IsConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connected
+}
+
 func ReplaceBridgeMention(content, bridgeUsername, pingID string) string {
 	if bridgeUsername == "" || pingID == "" {
 		return content
@@ -439,3 +530,6 @@ func ReplaceBridgeMention(content, bridgeUsername, pingID string) string {
 	pat := regexp.MustCompile(fmt.Sprintf(`(?i)@%s(?:\W|$)`, regexp.QuoteMeta(bridgeUsername)))
 	return pat.ReplaceAllString(content, fmt.Sprintf("<@%s>", pingID))
 }
+
+// Ensure socketTLSConfig is used (referenced in NewClient via session.Transport()).
+var _ = socketTLSConfig
