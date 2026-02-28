@@ -53,9 +53,9 @@ type Client struct {
 	stopCh      chan struct{}
 	wg          sync.WaitGroup
 
-	processedMu         sync.Mutex
-	processedMessageIDs []int
-	messageEditDates    *utils.BoundedMap
+	processedMu      sync.Mutex
+	processedUUIDs   []string
+	messageEditDates *utils.BoundedMap
 
 	OnMessage    func(map[string]interface{})
 	OnEdit       func(int, string)
@@ -86,7 +86,7 @@ func NewClient(roomID int, session *cookie.SessionService, debug bool) *Client {
 			TLSClientConfig:   tr.TLSClientConfig,
 		},
 		stopCh:              make(chan struct{}),
-		processedMessageIDs: make([]int, 0, ProcessedCacheSize),
+		processedUUIDs: make([]string, 0, ProcessedCacheSize),
 		messageEditDates:    utils.NewBoundedMap(MappingCacheSize, MappingMaxAge),
 		lastMessage:         time.Now(),
 	}
@@ -381,7 +381,6 @@ func (c *Client) handleIncoming(raw string) {
 		}
 		for _, id := range ids {
 			c.messageEditDates.Delete(id)
-			c.removeFromProcessed(id)
 			if c.OnDelete != nil {
 				c.OnDelete(id)
 			}
@@ -415,11 +414,12 @@ func (c *Client) processMessage(m SneedMessage) {
 	}
 	messageText = html.UnescapeString(messageText)
 
+	uuid := m.MessageUUID
 	editDate := m.MessageEditDate
 	deleted := m.Deleted || m.IsDeleted
 	if deleted {
 		c.messageEditDates.Delete(m.MessageID)
-		c.removeFromProcessed(m.MessageID)
+		c.removeFromProcessed(uuid)
 		if c.OnDelete != nil {
 			c.OnDelete(m.MessageID)
 		}
@@ -428,7 +428,7 @@ func (c *Client) processMessage(m SneedMessage) {
 
 	if (c.bridgeUserID > 0 && userID == c.bridgeUserID) ||
 		(c.bridgeUsername != "" && username == c.bridgeUsername) {
-		if m.MessageID > 0 && c.recentOutboundIter != nil && c.mapDiscordSneed != nil {
+		if uuid != "" && c.recentOutboundIter != nil && c.mapDiscordSneed != nil {
 			now := time.Now()
 			for _, entry := range c.recentOutboundIter() {
 				if mapped, ok := entry["mapped"].(bool); ok && mapped {
@@ -446,12 +446,12 @@ func (c *Client) processMessage(m SneedMessage) {
 				}
 			}
 		}
-		c.addToProcessed(m.MessageID)
+		c.addToProcessed(uuid)
 		c.messageEditDates.Set(m.MessageID, editDate)
 		return
 	}
 
-	if c.isProcessed(m.MessageID) {
+	if c.isProcessed(uuid) {
 		if prev, exists := c.messageEditDates.Get(m.MessageID); exists {
 			if editDate > prev.(int) {
 				c.messageEditDates.Set(m.MessageID, editDate)
@@ -463,7 +463,7 @@ func (c *Client) processMessage(m SneedMessage) {
 		return
 	}
 
-	c.addToProcessed(m.MessageID)
+	c.addToProcessed(uuid)
 	c.messageEditDates.Set(m.MessageID, editDate)
 
 	if c.OnMessage != nil {
@@ -477,33 +477,42 @@ func (c *Client) processMessage(m SneedMessage) {
 	}
 }
 
-func (c *Client) isProcessed(id int) bool {
+func (c *Client) isProcessed(uuid string) bool {
+	if uuid == "" {
+		return false
+	}
 	c.processedMu.Lock()
 	defer c.processedMu.Unlock()
-	for _, x := range c.processedMessageIDs {
-		if x == id {
+	for _, x := range c.processedUUIDs {
+		if x == uuid {
 			return true
 		}
 	}
 	return false
 }
 
-func (c *Client) addToProcessed(id int) {
+func (c *Client) addToProcessed(uuid string) {
+	if uuid == "" {
+		return
+	}
 	c.processedMu.Lock()
 	defer c.processedMu.Unlock()
-	c.processedMessageIDs = append(c.processedMessageIDs, id)
-	if len(c.processedMessageIDs) > ProcessedCacheSize {
-		excess := len(c.processedMessageIDs) - ProcessedCacheSize
-		c.processedMessageIDs = c.processedMessageIDs[excess:]
+	c.processedUUIDs = append(c.processedUUIDs, uuid)
+	if len(c.processedUUIDs) > ProcessedCacheSize {
+		excess := len(c.processedUUIDs) - ProcessedCacheSize
+		c.processedUUIDs = c.processedUUIDs[excess:]
 	}
 }
 
-func (c *Client) removeFromProcessed(id int) {
+func (c *Client) removeFromProcessed(uuid string) {
+	if uuid == "" {
+		return
+	}
 	c.processedMu.Lock()
 	defer c.processedMu.Unlock()
-	for i, x := range c.processedMessageIDs {
-		if x == id {
-			c.processedMessageIDs = append(c.processedMessageIDs[:i], c.processedMessageIDs[i+1:]...)
+	for i, x := range c.processedUUIDs {
+		if x == uuid {
+			c.processedUUIDs = append(c.processedUUIDs[:i], c.processedUUIDs[i+1:]...)
 			return
 		}
 	}

@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // SessionService manages XenForo session cookies as plain strings.
@@ -25,6 +26,7 @@ type SessionService struct {
 	username string
 	password string
 	tr       *http.Transport  // shared transport, TLS config applied once
+	stopCh   chan struct{}
 }
 
 // NewSessionService creates a service, performs initial login, and returns.
@@ -40,6 +42,7 @@ func NewSessionService(ctx context.Context, host, username, password string) (*S
 		username: username,
 		password: password,
 		tr:       tr,
+		stopCh:   make(chan struct{}),
 	}
 
 	log.Println("⏳ Logging in to Kiwi Farms...")
@@ -47,7 +50,43 @@ func NewSessionService(ctx context.Context, host, username, password string) (*S
 		return nil, fmt.Errorf("initial login: %w", err)
 	}
 	log.Println("✅ Login successful")
+
+	go s.refreshLoop(ctx)
+
 	return s, nil
+}
+
+// Close stops the background refresh loop. Call at shutdown after
+// sneedClient.Disconnect().
+func (s *SessionService) Close() {
+	close(s.stopCh)
+}
+
+// refreshLoop proactively renews all session cookies every 4 hours.
+// Prevents xf_session and xf_user from expiring mid-run so reconnect
+// attempts always have valid credentials. ttrs_clearance is cleared
+// so the next WebSocket dial solves it fresh.
+func (s *SessionService) refreshLoop(ctx context.Context) {
+	ticker := time.NewTicker(4 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			log.Println("🔄 Proactive session refresh (4h timer)...")
+			s.mu.Lock()
+			s.deleteCookie("ttrs_clearance")
+			if err := s.login(ctx); err != nil {
+				log.Printf("⚠️ Proactive session refresh failed: %v", err)
+			} else {
+				log.Println("✅ Proactive session refresh complete")
+			}
+			s.mu.Unlock()
+		case <-s.stopCh:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // tlsConfig mirrors sockchat's socketTLSConfig exactly:

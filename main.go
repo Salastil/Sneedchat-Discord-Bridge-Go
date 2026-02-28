@@ -15,9 +15,13 @@ import (
 
 func main() {
 	envFile := ".env"
+	debugFlag := false
 	for i, a := range os.Args {
 		if a == "--env" && i+1 < len(os.Args) {
 			envFile = os.Args[i+1]
+		}
+		if a == "--debug" {
+			debugFlag = true
 		}
 	}
 
@@ -25,6 +29,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	cfg.Debug = cfg.Debug || debugFlag
 	log.Printf("Using .env file: %s", envFile)
 	log.Printf("Using Sneedchat room ID: %d", cfg.SneedchatRoomID)
 	log.Printf("Bridge username: %s", cfg.BridgeUsername)
@@ -63,5 +68,6 @@ func main() {
 	log.Println("Shutdown signal received, cleaning up...")
 	bridge.Stop()
 	sneedClient.Disconnect()
+	session.Close()
 	log.Println("Bridge stopped successfully")
 }

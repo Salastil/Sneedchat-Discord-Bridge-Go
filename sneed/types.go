@@ -2,6 +2,7 @@ package sneed
 
 type SneedMessage struct {
 	MessageID       int                    `json:"message_id"`
+	MessageUUID     string                 `json:"message_uuid"`
 	Message         string                 `json:"message"`
 	MessageRaw      string                 `json:"message_raw"`
 	MessageEditDate int                    `json:"message_edit_date"`
