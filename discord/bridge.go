@@ -186,8 +186,9 @@ func (b *Bridge) onDiscordMessageCreate(s *discordgo.Session, m *discordgo.Messa
 
 	if m.ReferencedMessage != nil {
 		refDiscordID := parseMessageID(m.ReferencedMessage.ID)
-		if sneedIDInt, ok := b.discordToSneed.Get(refDiscordID); ok {
-			if uname, ok2 := b.sneedUsernames.Get(sneedIDInt.(int)); ok2 {
+		if sneedUUIDVal, ok := b.discordToSneed.Get(strconv.Itoa(refDiscordID)); ok {
+			sneedUUID := sneedUUIDVal.(string)
+			if uname, ok2 := b.sneedUsernames.Get(sneedUUID); ok2 {
 				contentText = fmt.Sprintf("@%s, %s", uname.(string), contentText)
 			}
 		}
@@ -289,14 +290,14 @@ func (b *Bridge) onDiscordMessageEdit(s *discordgo.Session, m *discordgo.Message
 		return
 	}
 	discordID := parseMessageID(m.ID)
-	sneedIDInt, ok := b.discordToSneed.Get(discordID)
+	sneedUUIDVal, ok := b.discordToSneed.Get(strconv.Itoa(discordID))
 	if !ok {
 		return
 	}
-	sneedID := sneedIDInt.(int)
-	payload := map[string]interface{}{"id": sneedID, "message": strings.TrimSpace(m.Content)}
+	sneedUUID := sneedUUIDVal.(string)
+	payload := map[string]interface{}{"uuid": sneedUUID, "message": strings.TrimSpace(m.Content)}
 	data, _ := json.Marshal(payload)
-	log.Printf("↩️ Discord edit -> Sneedchat (sneed_id=%d)", sneedID)
+	log.Printf("↩️ Discord edit -> Sneedchat (sneed_uuid=%s)", sneedUUID)
 	b.sneed.Send(fmt.Sprintf("/edit %s", string(data)))
 }
 
@@ -305,12 +306,13 @@ func (b *Bridge) onDiscordMessageDelete(s *discordgo.Session, m *discordgo.Messa
 		return
 	}
 	discordID := parseMessageID(m.ID)
-	sneedIDInt, ok := b.discordToSneed.Get(discordID)
+	sneedUUIDVal, ok := b.discordToSneed.Get(strconv.Itoa(discordID))
 	if !ok {
 		return
 	}
-	log.Printf("↩️ Discord delete -> Sneedchat (sneed_id=%d)", sneedIDInt.(int))
-	b.sneed.Send(fmt.Sprintf("/delete %d", sneedIDInt.(int)))
+	sneedUUID := sneedUUIDVal.(string)
+	log.Printf("↩️ Discord delete -> Sneedchat (sneed_uuid=%s)", sneedUUID)
+	b.sneed.Send(fmt.Sprintf("/delete %s", sneedUUID))
 }
 
 func (b *Bridge) onSneedMessage(msg map[string]interface{}) {
@@ -348,17 +350,17 @@ func (b *Bridge) onSneedMessage(msg map[string]interface{}) {
 	log.Printf("✅ Sent Sneedchat → Discord: %s", username)
 
 	if sent != nil {
-		if mid, ok := msg["message_id"].(int); ok && mid > 0 {
+		if uuid, ok := msg["message_uuid"].(string); ok && uuid != "" {
 			discordMsgID := parseMessageID(sent.ID)
-			b.sneedToDiscord.Set(mid, discordMsgID)
-			b.discordToSneed.Set(discordMsgID, mid)
-			b.sneedUsernames.Set(mid, username)
+			b.sneedToDiscord.Set(uuid, discordMsgID)
+			b.discordToSneed.Set(strconv.Itoa(discordMsgID), uuid)
+			b.sneedUsernames.Set(uuid, username)
 		}
 	}
 }
 
-func (b *Bridge) handleSneedEdit(sneedID int, newContent string) {
-	discordIDInt, ok := b.sneedToDiscord.Get(sneedID)
+func (b *Bridge) handleSneedEdit(sneedUUID string, newContent string) {
+	discordIDInt, ok := b.sneedToDiscord.Get(sneedUUID)
 	if !ok {
 		return
 	}
@@ -371,11 +373,11 @@ func (b *Bridge) handleSneedEdit(sneedID int, newContent string) {
 		log.Printf("❌ Failed to edit Discord message id=%d: %v", discordID, err)
 		return
 	}
-	log.Printf("✏️ Edited Discord (webhook) message id=%d (sneed_id=%d)", discordID, sneedID)
+	log.Printf("✏️ Edited Discord (webhook) message id=%d (sneed_uuid=%s)", discordID, sneedUUID)
 }
 
-func (b *Bridge) handleSneedDelete(sneedID int) {
-	discordIDInt, ok := b.sneedToDiscord.Get(sneedID)
+func (b *Bridge) handleSneedDelete(sneedUUID string) {
+	discordIDInt, ok := b.sneedToDiscord.Get(sneedUUID)
 	if !ok {
 		return
 	}
@@ -386,10 +388,10 @@ func (b *Bridge) handleSneedDelete(sneedID int) {
 		log.Printf("❌ Failed to delete Discord message id=%d: %v", discordID, err)
 		return
 	}
-	log.Printf("🗑️ Deleted Discord (webhook) message id=%d (sneed_id=%d)", discordID, sneedID)
-	b.sneedToDiscord.Delete(sneedID)
-	b.discordToSneed.Delete(discordID)
-	b.sneedUsernames.Delete(sneedID)
+	log.Printf("🗑️ Deleted Discord (webhook) message id=%d (sneed_uuid=%s)", discordID, sneedUUID)
+	b.sneedToDiscord.Delete(sneedUUID)
+	b.discordToSneed.Delete(strconv.Itoa(discordID))
+	b.sneedUsernames.Delete(sneedUUID)
 }
 
 func (b *Bridge) onSneedConnect() {
@@ -575,11 +577,11 @@ func (b *Bridge) recentOutboundIter() []map[string]interface{} {
 	return res
 }
 
-func (b *Bridge) mapDiscordSneed(discordID, sneedID int, username string) {
-	b.discordToSneed.Set(discordID, sneedID)
-	b.sneedToDiscord.Set(sneedID, discordID)
-	b.sneedUsernames.Set(sneedID, username)
-	log.Printf("Mapped sneed_id=%d <-> discord_id=%d (username='%s')", sneedID, discordID, username)
+func (b *Bridge) mapDiscordSneed(sneedUUID string, discordID int, username string) {
+	b.discordToSneed.Set(strconv.Itoa(discordID), sneedUUID)
+	b.sneedToDiscord.Set(sneedUUID, discordID)
+	b.sneedUsernames.Set(sneedUUID, username)
+	log.Printf("Mapped sneed_uuid=%s <-> discord_id=%d (username='%s')", sneedUUID, discordID, username)
 }
 
 func (b *Bridge) sendUploadStatusMessage(channelID, mention string, attachmentCount int) (*discordgo.Message, error) {
@@ -629,7 +631,7 @@ func (b *Bridge) awaitSneedConfirmation(discordID int, channelID, statusMessageI
 	for {
 		select {
 		case <-ticker.C:
-			if _, ok := b.discordToSneed.Get(discordID); ok {
+			if _, ok := b.discordToSneed.Get(strconv.Itoa(discordID)); ok {
 				desc := "Delivered to Sneedchat."
 				b.editUploadStatusMessage(channelID, statusMessageID, b.uploadStatusTitle("complete"), desc, UploadStatusColorSuccess)
 				b.scheduleUploadStatusDeletion(channelID, statusMessageID, UploadStatusCleanupDelay)

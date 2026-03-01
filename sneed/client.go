@@ -58,13 +58,13 @@ type Client struct {
 	messageEditDates *utils.BoundedMap
 
 	OnMessage    func(map[string]interface{})
-	OnEdit       func(int, string)
-	OnDelete     func(int)
+	OnEdit       func(string, string)
+	OnDelete     func(string)
 	OnConnect    func()
 	OnDisconnect func()
 
 	recentOutboundIter func() []map[string]interface{}
-	mapDiscordSneed    func(int, int, string)
+	mapDiscordSneed    func(string, int, string)
 
 	bridgeUserID     int
 	bridgeUsername   string
@@ -367,23 +367,14 @@ func (c *Client) handleIncoming(raw string) {
 		log.Printf("📦 payload: msgs=%d msg=%v del=%v", len(payload.Messages), payload.Message != nil, payload.Delete != nil)
 	}
 
-	if payload.Delete != nil {
-		var ids []int
-		switch v := payload.Delete.(type) {
-		case float64:
-			ids = []int{int(v)}
-		case []interface{}:
-			for _, x := range v {
-				if fid, ok := x.(float64); ok {
-					ids = append(ids, int(fid))
-				}
-			}
+	for _, uuid := range payload.Delete {
+		if uuid == "" {
+			continue
 		}
-		for _, id := range ids {
-			c.messageEditDates.Delete(id)
-			if c.OnDelete != nil {
-				c.OnDelete(id)
-			}
+		c.messageEditDates.Delete(uuid)
+		c.removeFromProcessed(uuid)
+		if c.OnDelete != nil {
+			c.OnDelete(uuid)
 		}
 	}
 
@@ -418,10 +409,10 @@ func (c *Client) processMessage(m SneedMessage) {
 	editDate := m.MessageEditDate
 	deleted := m.Deleted || m.IsDeleted
 	if deleted {
-		c.messageEditDates.Delete(m.MessageID)
+		c.messageEditDates.Delete(uuid)
 		c.removeFromProcessed(uuid)
 		if c.OnDelete != nil {
-			c.OnDelete(m.MessageID)
+			c.OnDelete(uuid)
 		}
 		return
 	}
@@ -438,7 +429,7 @@ func (c *Client) processMessage(m SneedMessage) {
 				if ts, ok := entry["ts"].(time.Time); ok {
 					if content == messageText && now.Sub(ts) <= OutboundMatchWindow {
 						if discordID, ok := entry["discord_id"].(int); ok {
-							c.mapDiscordSneed(discordID, m.MessageID, username)
+							c.mapDiscordSneed(uuid, discordID, username)
 							entry["mapped"] = true
 							break
 						}
@@ -447,16 +438,16 @@ func (c *Client) processMessage(m SneedMessage) {
 			}
 		}
 		c.addToProcessed(uuid)
-		c.messageEditDates.Set(m.MessageID, editDate)
+		c.messageEditDates.Set(uuid, editDate)
 		return
 	}
 
 	if c.isProcessed(uuid) {
-		if prev, exists := c.messageEditDates.Get(m.MessageID); exists {
+		if prev, exists := c.messageEditDates.Get(uuid); exists {
 			if editDate > prev.(int) {
-				c.messageEditDates.Set(m.MessageID, editDate)
+				c.messageEditDates.Set(uuid, editDate)
 				if c.OnEdit != nil {
-					c.OnEdit(m.MessageID, messageText)
+					c.OnEdit(uuid, messageText)
 				}
 			}
 		}
@@ -464,15 +455,16 @@ func (c *Client) processMessage(m SneedMessage) {
 	}
 
 	c.addToProcessed(uuid)
-	c.messageEditDates.Set(m.MessageID, editDate)
+	c.messageEditDates.Set(uuid, editDate)
 
 	if c.OnMessage != nil {
 		c.OnMessage(map[string]interface{}{
-			"username":   username,
-			"content":    messageText,
-			"message_id": m.MessageID,
-			"author_id":  userID,
-			"raw":        m,
+			"username":     username,
+			"content":      messageText,
+			"message_uuid": uuid,
+			"message_id":   m.MessageID,
+			"author_id":    userID,
+			"raw":          m,
 		})
 	}
 }
@@ -522,7 +514,7 @@ func (c *Client) SetOutboundIter(f func() []map[string]interface{}) {
 	c.recentOutboundIter = f
 }
 
-func (c *Client) SetMapDiscordSneed(f func(int, int, string)) {
+func (c *Client) SetMapDiscordSneed(f func(string, int, string)) {
 	c.mapDiscordSneed = f
 }
 

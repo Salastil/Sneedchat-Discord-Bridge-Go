@@ -14,5 +14,5 @@ type SneedMessage struct {
 type SneedPayload struct {
 	Messages []SneedMessage `json:"messages"`
 	Message  *SneedMessage  `json:"message"`
-	Delete   interface{}    `json:"delete"`
+	Delete   []string       `json:"delete"`
 }

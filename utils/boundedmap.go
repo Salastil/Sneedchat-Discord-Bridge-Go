@@ -7,24 +7,24 @@ import (
 
 type BoundedMap struct {
 	mu         sync.RWMutex
-	data       map[int]interface{}
-	timestamps map[int]time.Time
+	data       map[string]interface{}
+	timestamps map[string]time.Time
 	maxSize    int
 	maxAge     time.Duration
-	keys       []int
+	keys       []string
 }
 
 func NewBoundedMap(maxSize int, maxAge time.Duration) *BoundedMap {
 	return &BoundedMap{
-		data:       make(map[int]interface{}),
-		timestamps: make(map[int]time.Time),
+		data:       make(map[string]interface{}),
+		timestamps: make(map[string]time.Time),
 		maxSize:    maxSize,
 		maxAge:     maxAge,
-		keys:       make([]int, 0, maxSize),
+		keys:       make([]string, 0, maxSize),
 	}
 }
 
-func (bm *BoundedMap) Set(key int, value interface{}) {
+func (bm *BoundedMap) Set(key string, value interface{}) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	if _, ok := bm.data[key]; ok {
@@ -50,14 +50,14 @@ func (bm *BoundedMap) Set(key int, value interface{}) {
 	}
 }
 
-func (bm *BoundedMap) Get(key int) (interface{}, bool) {
+func (bm *BoundedMap) Get(key string) (interface{}, bool) {
 	bm.mu.RLock()
 	defer bm.mu.RUnlock()
 	v, ok := bm.data[key]
 	return v, ok
 }
 
-func (bm *BoundedMap) Delete(key int) {
+func (bm *BoundedMap) Delete(key string) {
 	bm.mu.Lock()
 	defer bm.mu.Unlock()
 	delete(bm.data, key)
