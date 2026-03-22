@@ -5,6 +5,7 @@ type SneedMessage struct {
 	MessageUUID     string                 `json:"message_uuid"`
 	Message         string                 `json:"message"`
 	MessageRaw      string                 `json:"message_raw"`
+	MessageDate     int                    `json:"message_date"`
 	MessageEditDate int                    `json:"message_edit_date"`
 	Author          map[string]interface{} `json:"author"`
 	Deleted         bool                   `json:"deleted"`
