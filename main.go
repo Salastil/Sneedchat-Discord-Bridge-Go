@@ -37,16 +37,33 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// When cfg.TorEnabled, the bridge starts and owns its own private Tor
+	// process (via a local "tor" executable) and routes the Sneedchat
+	// session through it. Nothing external needs to be running. Discord and
+	// media uploads use their own separate clients and are never routed
+	// through Tor.
+	var dial cookie.DialContextFunc
+	if cfg.TorEnabled {
+		log.Println("🧅 Starting bridge-managed Tor process...")
+		torInstance, torDial, err := cookie.StartTor(ctx)
+		if err != nil {
+			log.Fatalf("❌ Failed to start Tor: %v", err)
+		}
+		defer torInstance.Close()
+		dial = torDial
+		log.Println("✅ Tor process ready")
+	}
+
 	// SessionService owns the TLS config, cookie store, and shared transport.
 	// Login is performed here; cookies are stored as plain strings, no jar.
-	session, err := cookie.NewSessionService(ctx, "kiwifarms.st", cfg.BridgeUsername, cfg.BridgePassword)
+	session, err := cookie.NewSessionService(ctx, cfg.KiwiScheme, cfg.KiwiHost, cfg.BridgeUsername, cfg.BridgePassword, dial, cfg.KiwiTLSInsecureSkipVerify)
 	if err != nil {
 		log.Fatalf("❌ Failed to establish session: %v", err)
 	}
 
 	// NewClient uses session.Transport() for the WebSocket dialer,
 	// mirroring sockchat's NewSocket pattern exactly.
-	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, session, cfg.Debug)
+	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, session, cfg.Debug, cfg.SneedchatWSURL)
 	sneedClient.SetBridgeIdentity(cfg.BridgeUserID, cfg.BridgeUsername)
 
 	bridge, err := discord.NewBridge(cfg, sneedClient)

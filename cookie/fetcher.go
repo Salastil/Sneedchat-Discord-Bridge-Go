@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -15,6 +16,12 @@ import (
 	"sync"
 	"time"
 )
+
+// DialContextFunc matches http.Transport.DialContext. Passing one to
+// NewSessionService routes every request the session makes — including the
+// WebSocket dial that reuses Transport() — through it, e.g. through a
+// bridge-managed Tor process. Pass nil to dial directly.
+type DialContextFunc func(ctx context.Context, network, address string) (net.Conn, error)
 
 // SessionService manages XenForo session cookies as plain strings.
 // No http.Client jar is used anywhere — every cookie is stored explicitly
@@ -30,11 +37,23 @@ type SessionService struct {
 }
 
 // NewSessionService creates a service, performs initial login, and returns.
-func NewSessionService(ctx context.Context, host, username, password string) (*SessionService, error) {
-	u, _ := url.Parse("https://" + host + "/")
+// scheme is typically "https" but may be "http" for .onion mirrors that
+// don't terminate TLS. dial, if non-nil, replaces the transport's dial
+// function — used to route the session (and the WebSocket dial that reuses
+// Transport()) through a bridge-managed Tor process to reach a .onion host.
+// tlsInsecureSkipVerify disables certificate verification, which some
+// .onion mirrors need since they serve self-signed certs.
+func NewSessionService(ctx context.Context, scheme, host, username, password string, dial DialContextFunc, tlsInsecureSkipVerify bool) (*SessionService, error) {
+	u, _ := url.Parse(scheme + "://" + host + "/")
 
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = tlsConfig()
+	if tlsInsecureSkipVerify {
+		tr.TLSClientConfig.InsecureSkipVerify = true
+	}
+	if dial != nil {
+		tr.DialContext = dial
+	}
 
 	s := &SessionService{
 		cookies:  make(map[string]string),

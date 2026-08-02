@@ -10,6 +10,8 @@ A high-performance bridge written in Go that synchronizes messages between Kiwi 
 - ✅ Pluggable media upload services (Litterbox by default)
 - ✅ BBCode → Markdown parsing
 - ✅ Message queueing during outages
+- ✅ Sneedchat MOTD mirrored to a pinned Discord message, auto-updated when the MOTD changes
+- ✅ Optional Tor routing for the Sneedchat connection, self-managed by the bridge — Discord and media uploads always stay on clearnet
 
 ## Performance
 
@@ -87,7 +89,7 @@ Launch using ./sneedchat-bridge --env .env
 3. Select **BOT PERMISSIONS**:
    - ✅ `Read Messages/View Channels`
    - ✅ `Send Messages`
-   - ✅ `Manage Messages` (for edits/deletes)
+   - ✅ `Manage Messages` (for edits/deletes/MOTD pinning)
    - ✅ `Embed Links`
    - ✅ `Attach Files`
    - ✅ `Read Message History`
@@ -192,6 +194,26 @@ Watch for:
 
 Press `Ctrl+C` to terminate bridge.
 
+### Connecting to Sneedchat over Tor
+
+The Sneedchat connection (both the login HTTP requests and the chat WebSocket) can be routed through Tor to the Kiwi Farms `.onion` address instead of clearnet. Discord and media uploads (Litterbox/Catbox) always go out on clearnet and are never affected by this setting.
+
+The bridge starts and manages its own private Tor process itself when this is enabled — there's no separate Tor daemon or Tor Browser to run. It just needs a `tor` executable installed and on `PATH`:
+
+```bash
+# Debian/Ubuntu
+sudo apt install tor
+# The systemd tor.service that comes with this package isn't needed —
+# don't enable/start it. The bridge launches its own private instance.
+```
+
+The Docker image already includes it. Then set in your `.env`:
+
+```env
+TOR=true
+```
+
+Leave it unset (or `false`) to keep the default clearnet connection to `kiwifarms.st`.
 
 ## Systemd Service Setup:
 ---

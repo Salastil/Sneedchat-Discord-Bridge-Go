@@ -50,13 +50,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	session, err := cookie.NewSessionService(ctx, "kiwifarms.st", cfg.BridgeUsername, cfg.BridgePassword)
+	var dial cookie.DialContextFunc
+	if cfg.TorEnabled {
+		logger.Println("🧅 Starting bridge-managed Tor process...")
+		torInstance, torDial, terr := cookie.StartTor(ctx)
+		if terr != nil {
+			log.Fatalf("Failed to start Tor: %v", terr)
+		}
+		defer torInstance.Close()
+		dial = torDial
+		logger.Println("✅ Tor process ready")
+	}
+
+	session, err := cookie.NewSessionService(ctx, cfg.KiwiScheme, cfg.KiwiHost, cfg.BridgeUsername, cfg.BridgePassword, dial, cfg.KiwiTLSInsecureSkipVerify)
 	if err != nil {
 		log.Fatalf("Failed to establish session: %v", err)
 	}
 	defer session.Close()
 
-	client := sneed.NewClient(cfg.SneedchatRoomID, session, true)
+	client := sneed.NewClient(cfg.SneedchatRoomID, session, true, cfg.SneedchatWSURL)
 	client.SetBridgeIdentity(cfg.BridgeUserID, cfg.BridgeUsername)
 
 	client.OnRaw = func(raw string) {
