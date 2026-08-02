@@ -23,7 +23,10 @@ var (
 	// spoilerOpenPattern is a fallback for Sneedchat's spoiler shorthand,
 	// which is sometimes sent without a closing [/spoiler] tag (the site's
 	// own HTML rendering treats the spoiler as running to the end of the
-	// message in that case, so we mirror that here).
+	// message in that case, so we mirror that here). Both just unwrap the
+	// tag rather than converting to Discord's ||spoiler|| syntax, since
+	// wrapping a raw image/link URL in || prevents Discord from unfurling
+	// it into an embed.
 	spoilerPattern     = regexp.MustCompile(`(?is)\[spoiler(?:=(?:"[^"]*"|'[^']*'|[^\]]*))?\](.*?)\[/spoiler\]`)
 	spoilerOpenPattern = regexp.MustCompile(`(?is)\[spoiler(?:=(?:"[^"]*"|'[^']*'|[^\]]*))?\](.*)$`)
 	colorSizePattern   = regexp.MustCompile(`(?i)\[(?:color|size)=.*?\](.*?)\[/\s*(?:color|size)\]`)
@@ -81,8 +84,8 @@ func BBCodeToMarkdown(text string) string {
 		return strings.Join(lines, "\n")
 	})
 
-	text = spoilerPattern.ReplaceAllString(text, "||$1||")
-	text = spoilerOpenPattern.ReplaceAllString(text, "||$1||")
+	text = spoilerPattern.ReplaceAllString(text, "$1")
+	text = spoilerOpenPattern.ReplaceAllString(text, "$1")
 	text = colorSizePattern.ReplaceAllString(text, "$1")
 	text = listItemPattern.ReplaceAllString(text, "• ")
 	text = listTagPattern.ReplaceAllString(text, "")
