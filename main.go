@@ -37,13 +37,26 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// When cfg.TorEnabled, the bridge starts and owns its own private Tor
+	// process (via a local "tor" executable) and routes the Sneedchat
+	// session through it. Nothing external needs to be running. Discord and
+	// media uploads use their own separate clients and are never routed
+	// through Tor.
+	var dial cookie.DialContextFunc
+	if cfg.TorEnabled {
+		log.Println("🧅 Starting bridge-managed Tor process...")
+		torInstance, torDial, err := cookie.StartTor(ctx)
+		if err != nil {
+			log.Fatalf("❌ Failed to start Tor: %v", err)
+		}
+		defer torInstance.Close()
+		dial = torDial
+		log.Println("✅ Tor process ready")
+	}
+
 	// SessionService owns the TLS config, cookie store, and shared transport.
 	// Login is performed here; cookies are stored as plain strings, no jar.
-	// When cfg.TorSocksProxy is set, every request this session makes —
-	// including the WebSocket dial below — is routed through Tor, which is
-	// required when cfg.KiwiHost is a .onion address. Discord and media
-	// uploads use their own separate clients and are never routed through Tor.
-	session, err := cookie.NewSessionService(ctx, cfg.KiwiScheme, cfg.KiwiHost, cfg.BridgeUsername, cfg.BridgePassword, cfg.TorSocksProxy, cfg.KiwiTLSInsecureSkipVerify)
+	session, err := cookie.NewSessionService(ctx, cfg.KiwiScheme, cfg.KiwiHost, cfg.BridgeUsername, cfg.BridgePassword, dial, cfg.KiwiTLSInsecureSkipVerify)
 	if err != nil {
 		log.Fatalf("❌ Failed to establish session: %v", err)
 	}

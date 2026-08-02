@@ -9,6 +9,11 @@ import (
 	"github.com/joho/godotenv"
 )
 
+const (
+	kiwiClearnetHost = "kiwifarms.st"
+	kiwiOnionHost    = "kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion"
+)
+
 type Config struct {
 	DiscordBotToken    string
 	DiscordChannelID   string
@@ -22,21 +27,19 @@ type Config struct {
 	DiscordPingUserID  string
 	Debug              bool
 
-	// KiwiScheme/KiwiHost address Kiwi Farms for the HTTP login/session
-	// requests. KiwiHost may be set to a .onion address to log in over Tor.
-	KiwiScheme string
-	KiwiHost   string
-	// SneedchatWSURL is the full WebSocket URL for the chat connection.
-	// Defaults to the historical clearnet endpoint; set explicitly when
-	// KiwiHost points at a .onion service with a different WS host/port.
-	SneedchatWSURL string
-	// TorSocksProxy, when non-empty (e.g. "127.0.0.1:9050"), routes all
-	// Sneedchat traffic (login HTTP requests and the WebSocket connection)
-	// through a Tor SOCKS5 proxy. Discord and media uploads are unaffected
-	// and always go out on clearnet.
-	TorSocksProxy string
-	// KiwiTLSInsecureSkipVerify skips TLS certificate verification for
-	// Kiwi Farms connections. Some .onion mirrors serve self-signed certs.
+	// TorEnabled routes the Sneedchat connection (login HTTP requests and
+	// the chat WebSocket) through a bridge-managed Tor process to the Kiwi
+	// Farms .onion address instead of clearnet. The bridge starts and stops
+	// this Tor process itself — nothing external needs to be running.
+	// Discord and media uploads are unaffected and always go out on
+	// clearnet.
+	TorEnabled bool
+
+	// KiwiScheme/KiwiHost/SneedchatWSURL/KiwiTLSInsecureSkipVerify are
+	// derived from TorEnabled, not set directly via the environment.
+	KiwiScheme                string
+	KiwiHost                  string
+	SneedchatWSURL            string
 	KiwiTLSInsecureSkipVerify bool
 }
 
@@ -53,27 +56,25 @@ func Load(envFile string) (*Config, error) {
 		BridgeUsername:     os.Getenv("BRIDGE_USERNAME"),
 		BridgePassword:     os.Getenv("BRIDGE_PASSWORD"),
 		DiscordPingUserID:  os.Getenv("DISCORD_PING_USER_ID"),
-		KiwiScheme:         os.Getenv("KIWIFARMS_SCHEME"),
-		KiwiHost:           os.Getenv("KIWIFARMS_HOST"),
-		SneedchatWSURL:     os.Getenv("SNEEDCHAT_WS_URL"),
-		TorSocksProxy:      os.Getenv("TOR_SOCKS_PROXY"),
 	}
 	if cfg.MediaUploadService == "" {
 		cfg.MediaUploadService = "litterbox"
 	}
-	if cfg.KiwiScheme == "" {
-		cfg.KiwiScheme = "https"
+
+	if v := os.Getenv("TOR"); v == "1" || v == "true" {
+		cfg.TorEnabled = true
 	}
-	if cfg.KiwiHost == "" {
-		cfg.KiwiHost = "kiwifarms.st"
+	cfg.KiwiScheme = "https"
+	if cfg.TorEnabled {
+		cfg.KiwiHost = kiwiOnionHost
+		// The .onion address itself authenticates the origin, so Kiwi
+		// Farms' onion service doesn't need a CA-signed cert on top.
+		cfg.KiwiTLSInsecureSkipVerify = true
+	} else {
+		cfg.KiwiHost = kiwiClearnetHost
 	}
-	if cfg.SneedchatWSURL == "" {
-		wsScheme := "wss"
-		if cfg.KiwiScheme == "http" {
-			wsScheme = "ws"
-		}
-		cfg.SneedchatWSURL = fmt.Sprintf("%s://%s:9443/chat.ws", wsScheme, cfg.KiwiHost)
-	}
+	cfg.SneedchatWSURL = fmt.Sprintf("wss://%s:9443/chat.ws", cfg.KiwiHost)
+
 	roomID, err := strconv.Atoi(os.Getenv("SNEEDCHAT_ROOM_ID"))
 	if err != nil {
 		return nil, fmt.Errorf("invalid SNEEDCHAT_ROOM_ID: %w", err)
@@ -84,9 +85,6 @@ func Load(envFile string) (*Config, error) {
 	}
 	if os.Getenv("DEBUG") == "1" || os.Getenv("DEBUG") == "true" {
 		cfg.Debug = true
-	}
-	if os.Getenv("KIWIFARMS_TLS_INSECURE_SKIP_VERIFY") == "1" || os.Getenv("KIWIFARMS_TLS_INSECURE_SKIP_VERIFY") == "true" {
-		cfg.KiwiTLSInsecureSkipVerify = true
 	}
 	return cfg, nil
 }

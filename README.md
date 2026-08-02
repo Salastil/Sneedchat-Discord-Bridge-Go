@@ -11,7 +11,7 @@ A high-performance bridge written in Go that synchronizes messages between Kiwi 
 - ✅ BBCode → Markdown parsing
 - ✅ Message queueing during outages
 - ✅ Sneedchat MOTD mirrored to a pinned Discord message, auto-updated when the MOTD changes
-- ✅ Optional Tor routing for the Sneedchat connection (supports `.onion` mirrors) — Discord and media uploads always stay on clearnet
+- ✅ Optional Tor routing for the Sneedchat connection, self-managed by the bridge — Discord and media uploads always stay on clearnet
 
 ## Performance
 
@@ -196,22 +196,24 @@ Press `Ctrl+C` to terminate bridge.
 
 ### Connecting to Sneedchat over Tor
 
-The Sneedchat connection (both the login HTTP requests and the chat WebSocket) can be routed through Tor to reach a `.onion` mirror, independent of everything else. Discord and media uploads (Litterbox/Catbox) always go out on clearnet and are never affected by these settings.
+The Sneedchat connection (both the login HTTP requests and the chat WebSocket) can be routed through Tor to the Kiwi Farms `.onion` address instead of clearnet. Discord and media uploads (Litterbox/Catbox) always go out on clearnet and are never affected by this setting.
 
-Run a local Tor client (e.g. `tor` or Tor Browser) so a SOCKS5 proxy is listening, then set in your `.env`:
+The bridge starts and manages its own private Tor process itself when this is enabled — there's no separate Tor daemon or Tor Browser to run. It just needs a `tor` executable installed and on `PATH`:
 
-```env
-KIWIFARMS_HOST=kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion
-KIWIFARMS_SCHEME=https
-TOR_SOCKS_PROXY=127.0.0.1:9050
-# Only needed if the mirror serves a self-signed certificate
-KIWIFARMS_TLS_INSECURE_SKIP_VERIFY=false
-# Only needed if the .onion mirror's WebSocket endpoint differs from
-# the default (KIWIFARMS_HOST on port 9443 at /chat.ws)
-# SNEEDCHAT_WS_URL=wss://kiwifarmsaaf4t2h7gc3dfc5ojhmqruw2nit3uejrpiagrxeuxiyxcyd.onion:9443/chat.ws
+```bash
+# Debian/Ubuntu
+sudo apt install tor
+# The systemd tor.service that comes with this package isn't needed —
+# don't enable/start it. The bridge launches its own private instance.
 ```
 
-Leave `KIWIFARMS_HOST` and `TOR_SOCKS_PROXY` unset to keep the default clearnet connection to `kiwifarms.st`.
+The Docker image already includes it. Then set in your `.env`:
+
+```env
+TOR=true
+```
+
+Leave it unset (or `false`) to keep the default clearnet connection to `kiwifarms.st`.
 
 ## Systemd Service Setup:
 ---

@@ -10,7 +10,7 @@ RUN go mod tidy && go build -o Sneedchat-Discord-Bridge .
 
 FROM alpine:latest
 
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates tor
 
 WORKDIR /app
 
