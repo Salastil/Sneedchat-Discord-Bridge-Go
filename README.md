@@ -10,6 +10,7 @@ A high-performance bridge written in Go that synchronizes messages between Kiwi 
 - ✅ Pluggable media upload services (Litterbox by default)
 - ✅ BBCode → Markdown parsing
 - ✅ Message queueing during outages
+- ✅ Sneedchat MOTD mirrored to a pinned Discord message, auto-updated when the MOTD changes
 
 ## Performance
 
@@ -87,7 +88,7 @@ Launch using ./sneedchat-bridge --env .env
 3. Select **BOT PERMISSIONS**:
    - ✅ `Read Messages/View Channels`
    - ✅ `Send Messages`
-   - ✅ `Manage Messages` (for edits/deletes)
+   - ✅ `Manage Messages` (for edits/deletes/MOTD pinning)
    - ✅ `Embed Links`
    - ✅ `Attach Files`
    - ✅ `Read Message History`

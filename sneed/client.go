@@ -68,6 +68,9 @@ type Client struct {
 	// tools that need to observe the unfiltered stream.
 	OnRaw func(string)
 
+	// OnMOTD is called whenever the server sends the room's message-of-the-day.
+	OnMOTD func(SneedMOTD)
+
 	recentOutboundIter func() []map[string]interface{}
 	mapDiscordSneed    func(string, int, string)
 
@@ -374,6 +377,10 @@ func (c *Client) handleIncoming(raw string) {
 
 	if c.debug {
 		log.Printf("📦 payload: msgs=%d msg=%v del=%v", len(payload.Messages), payload.Message != nil, payload.Delete != nil)
+	}
+
+	if payload.MOTD != nil && c.OnMOTD != nil {
+		c.OnMOTD(*payload.MOTD)
 	}
 
 	for _, uuid := range payload.Delete {

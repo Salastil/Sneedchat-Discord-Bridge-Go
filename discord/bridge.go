@@ -39,6 +39,7 @@ const (
 	UploadDeliveryTimeout       = 2 * time.Minute
 	UploadStatusCleanupDelay    = 15 * time.Second
 	UploadStatusFailureLifetime = 60 * time.Second
+	MOTDEmbedColor              = 0x5865F2
 )
 
 type OutboundEntry struct {
@@ -76,10 +77,14 @@ type Bridge struct {
 	outageMessagesMu    sync.Mutex
 	outageStart         time.Time
 
-	stopCh     chan struct{}
-	wg         sync.WaitGroup
-	msgQueue   chan map[string]interface{}
-	overflow   bool
+	motdMu        sync.Mutex
+	motdUUID      string
+	motdMessageID string
+
+	stopCh   chan struct{}
+	wg       sync.WaitGroup
+	msgQueue chan map[string]interface{}
+	overflow bool
 }
 
 func NewBridge(cfg *config.Config, sneedClient *sneed.Client) (*Bridge, error) {
@@ -112,6 +117,7 @@ func NewBridge(cfg *config.Config, sneedClient *sneed.Client) (*Bridge, error) {
 	sneedClient.OnDelete = b.handleSneedDelete
 	sneedClient.OnConnect = b.onSneedConnect
 	sneedClient.OnDisconnect = b.onSneedDisconnect
+	sneedClient.OnMOTD = b.handleMOTD
 	sneedClient.SetOutboundIter(b.recentOutboundIter)
 	sneedClient.SetMapDiscordSneed(b.mapDiscordSneed)
 	sneedClient.SetBridgeIdentity(cfg.BridgeUserID, cfg.BridgeUsername)
@@ -499,6 +505,56 @@ func (b *Bridge) onSneedDisconnect() {
 	log.Println("🔴 Sneedchat disconnected")
 	b.session.UpdateStatusComplex(discordgo.UpdateStatusData{Status: "idle"})
 	b.startOutageNotificationLoop()
+}
+
+// handleMOTD keeps a single Discord pinned message in sync with Sneedchat's
+// room MOTD. When the MOTD changes, the previously pinned MOTD message is
+// unpinned before the new one is posted and pinned.
+func (b *Bridge) handleMOTD(m sneed.SneedMOTD) {
+	b.motdMu.Lock()
+	defer b.motdMu.Unlock()
+
+	if m.MessageUUID != "" && m.MessageUUID == b.motdUUID {
+		return
+	}
+
+	username := "Unknown"
+	if u, ok := m.Author["username"].(string); ok {
+		username = u
+	}
+	content := utils.BBCodeToMarkdown(m.MessageRaw)
+	if content == "" {
+		content = utils.BBCodeToMarkdown(m.Message)
+	}
+	content = sneed.ReplaceBridgeMention(content, b.cfg.BridgeUsername, b.cfg.DiscordPingUserID)
+
+	if b.motdMessageID != "" {
+		if err := b.session.ChannelMessageUnpin(b.cfg.DiscordChannelID, b.motdMessageID); err != nil {
+			log.Printf("⚠️ Failed to unpin previous MOTD message: %v", err)
+		}
+	}
+
+	webhookID, webhookToken := parseWebhookURL(b.cfg.DiscordWebhookURL)
+	embed := &discordgo.MessageEmbed{
+		Title:       "📌 Message of the Day",
+		Description: content,
+		Color:       MOTDEmbedColor,
+		Footer:      &discordgo.MessageEmbedFooter{Text: "Set by " + username},
+	}
+	params := &discordgo.WebhookParams{Embeds: []*discordgo.MessageEmbed{embed}}
+	sent, err := b.session.WebhookExecute(webhookID, webhookToken, true, params)
+	if err != nil {
+		log.Printf("❌ Failed to post MOTD message: %v", err)
+		return
+	}
+
+	if err := b.session.ChannelMessagePin(b.cfg.DiscordChannelID, sent.ID); err != nil {
+		log.Printf("⚠️ Failed to pin MOTD message: %v", err)
+	}
+
+	b.motdUUID = m.MessageUUID
+	b.motdMessageID = sent.ID
+	log.Printf("📌 Updated Discord MOTD pin (uuid=%s)", m.MessageUUID)
 }
 
 func (b *Bridge) flushQueuedMessages() {
