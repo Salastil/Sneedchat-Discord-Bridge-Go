@@ -63,6 +63,11 @@ type Client struct {
 	OnConnect    func()
 	OnDisconnect func()
 
+	// OnRaw, if set, is called with every raw WebSocket frame exactly as
+	// received, before any parsing or truncation. Intended for debugging
+	// tools that need to observe the unfiltered stream.
+	OnRaw func(string)
+
 	recentOutboundIter func() []map[string]interface{}
 	mapDiscordSneed    func(string, int, string)
 
@@ -196,6 +201,10 @@ func (c *Client) readLoop(ctx context.Context) {
 		}
 
 		raw := string(message)
+
+		if c.OnRaw != nil {
+			c.OnRaw(raw)
+		}
 
 		// Server sends plaintext "cannot join" when session has expired.
 		if isCannotJoin(raw) {
