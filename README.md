@@ -245,6 +245,31 @@ sudo systemctl status sneedchat-bridge
 
 ---
 
+## Debugging Tools
+
+### wsdebug — standalone WebSocket inspector
+
+`wsdebug` is a separate binary that logs into Kiwi Farms using the same `.env` file as the bridge, connects directly to the Sneedchat WebSocket, and prints every raw frame it receives to stdout while also writing it to a log file. It doesn't touch Discord at all — use it to see exactly what Sneedchat is sending, independent of the bridge.
+
+Build it:
+
+```bash
+go build -o wsdebug ./cmd/wsdebug
+```
+
+Run it:
+
+```bash
+./wsdebug --env .env --log wsdebug.log --room 1
+```
+
+Flags:
+- `--env` - path to the `.env` file to load (default `.env`)
+- `--log` - path to the log file to append output to (default `wsdebug.log`)
+- `--room` - override `SNEEDCHAT_ROOM_ID` from the `.env` file (optional)
+
+Press `Ctrl+C` to stop. Every raw WebSocket frame, plus connect/disconnect/message/edit/delete events, are printed to the terminal and appended to the log file simultaneously.
+
 ## Troubleshooting
 
 ### Cookie Issues
