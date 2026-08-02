@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/proxy"
 )
 
 // SessionService manages XenForo session cookies as plain strings.
@@ -30,11 +32,34 @@ type SessionService struct {
 }
 
 // NewSessionService creates a service, performs initial login, and returns.
-func NewSessionService(ctx context.Context, host, username, password string) (*SessionService, error) {
-	u, _ := url.Parse("https://" + host + "/")
+// scheme is typically "https" but may be "http" for .onion mirrors that
+// don't terminate TLS. torSocksProxy, when non-empty (e.g. "127.0.0.1:9050"),
+// routes every request this service makes — including the WebSocket dial
+// that reuses Transport() — through a Tor SOCKS5 proxy, which is required
+// to reach a .onion host. tlsInsecureSkipVerify disables certificate
+// verification, which some .onion mirrors need since they serve
+// self-signed certs.
+func NewSessionService(ctx context.Context, scheme, host, username, password, torSocksProxy string, tlsInsecureSkipVerify bool) (*SessionService, error) {
+	u, _ := url.Parse(scheme + "://" + host + "/")
 
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.TLSClientConfig = tlsConfig()
+	if tlsInsecureSkipVerify {
+		tr.TLSClientConfig.InsecureSkipVerify = true
+	}
+
+	if torSocksProxy != "" {
+		dialer, err := proxy.SOCKS5("tcp", torSocksProxy, nil, proxy.Direct)
+		if err != nil {
+			return nil, fmt.Errorf("creating Tor SOCKS5 dialer: %w", err)
+		}
+		contextDialer, ok := dialer.(proxy.ContextDialer)
+		if !ok {
+			return nil, fmt.Errorf("Tor SOCKS5 dialer does not support DialContext")
+		}
+		tr.DialContext = contextDialer.DialContext
+		log.Printf("🧅 Routing Kiwi Farms connection through Tor SOCKS5 proxy at %s", torSocksProxy)
+	}
 
 	s := &SessionService{
 		cookies:  make(map[string]string),

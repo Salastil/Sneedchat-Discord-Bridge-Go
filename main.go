@@ -39,14 +39,18 @@ func main() {
 
 	// SessionService owns the TLS config, cookie store, and shared transport.
 	// Login is performed here; cookies are stored as plain strings, no jar.
-	session, err := cookie.NewSessionService(ctx, "kiwifarms.st", cfg.BridgeUsername, cfg.BridgePassword)
+	// When cfg.TorSocksProxy is set, every request this session makes —
+	// including the WebSocket dial below — is routed through Tor, which is
+	// required when cfg.KiwiHost is a .onion address. Discord and media
+	// uploads use their own separate clients and are never routed through Tor.
+	session, err := cookie.NewSessionService(ctx, cfg.KiwiScheme, cfg.KiwiHost, cfg.BridgeUsername, cfg.BridgePassword, cfg.TorSocksProxy, cfg.KiwiTLSInsecureSkipVerify)
 	if err != nil {
 		log.Fatalf("❌ Failed to establish session: %v", err)
 	}
 
 	// NewClient uses session.Transport() for the WebSocket dialer,
 	// mirroring sockchat's NewSocket pattern exactly.
-	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, session, cfg.Debug)
+	sneedClient := sneed.NewClient(cfg.SneedchatRoomID, session, cfg.Debug, cfg.SneedchatWSURL)
 	sneedClient.SetBridgeIdentity(cfg.BridgeUserID, cfg.BridgeUsername)
 
 	bridge, err := discord.NewBridge(cfg, sneedClient)

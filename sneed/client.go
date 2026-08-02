@@ -80,11 +80,11 @@ type Client struct {
 	debug            bool
 }
 
-func NewClient(roomID int, session *cookie.SessionService, debug bool) *Client {
+func NewClient(roomID int, session *cookie.SessionService, debug bool, wsURL string) *Client {
 	tr := session.Transport()
 
 	return &Client{
-		wsURL:   "wss://kiwifarms.st:9443/chat.ws",
+		wsURL:   wsURL,
 		roomID:  roomID,
 		session: session,
 		debug:   debug,
